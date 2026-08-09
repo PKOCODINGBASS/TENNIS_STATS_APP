@@ -281,12 +281,12 @@ def _extraire_matchs_depuis_scoreboard(data: dict, ligue_slug: str) -> list[dict
 
 
 @st.cache_data(show_spinner=False, ttl=180)
-def obtenir_matchs_tennis_du_jour(cache_bust: int = 0) -> tuple[list[dict], str]:
+def obtenir_matchs_tennis_du_jour(cache_bust: int = 0, _cache_version: int = 2) -> tuple[list[dict], str]:
     """
     Agrège tous les matchs du jour (heure de Paris), tous championnats ESPN
     disponibles. `cache_bust` force le rafraîchissement depuis l'UI.
     """
-    del cache_bust
+    del cache_bust, _cache_version
     aujourdhui = datetime.now(TZ_PARIS).strftime("%Y-%m-%d")
     vus = set()
     matchs = []
@@ -652,7 +652,11 @@ with onglets[0]:
             st.session_state.tennis_resume_bust = 0
         if st.button("🔄 Rafraîchir les scores", key="btn_refresh_resume"):
             st.session_state.tennis_resume_bust += 1
-            obtenir_matchs_tennis_du_jour.clear()
+            try:
+                obtenir_matchs_tennis_du_jour.clear()
+                _charger_scoreboard_espn.clear()
+            except Exception:
+                pass
 
         with st.spinner("Récupération des scores tennis (ESPN)..."):
             df_resume, err, date_ref = construire_resume_tennis(st.session_state.tennis_resume_bust)

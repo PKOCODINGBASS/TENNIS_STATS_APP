@@ -281,7 +281,7 @@ def _extraire_matchs_depuis_scoreboard(data: dict, ligue_slug: str) -> list[dict
 
 
 @st.cache_data(show_spinner=False, ttl=180)
-def obtenir_matchs_tennis_du_jour(cache_bust: int = 0, _cache_version: int = 3) -> tuple[list[dict], str]:
+def obtenir_matchs_tennis_du_jour(cache_bust: int = 0, _cache_version: int = 4) -> tuple[list[dict], str]:
     """
     Agrège les matchs de la journée tennis (heure de Paris), tous championnats ESPN.
     Inclut : date Paris = aujourd'hui, plus les matchs encore en cours / à venir

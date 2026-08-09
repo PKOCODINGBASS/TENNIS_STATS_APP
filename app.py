@@ -303,8 +303,9 @@ def obtenir_matchs_tennis_du_jour(cache_bust: int = 0, _cache_version: int = 3) 
             state = m.get("state") or ""
             if date_m == aujourdhui:
                 garder = True
-            elif date_m == hier and state in ("in", "pre"):
-                # Session US encore live / pas jouée après minuit Paris
+            elif date_m == hier and state in ("in", "pre", "post"):
+                # Session US : encore live, à venir, ou déjà finie après minuit Paris
+                # (nécessaire pour le tableau de validation des confrontations terminées).
                 garder = True
             else:
                 garder = False

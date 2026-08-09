@@ -1,0 +1,1097 @@
+"""
+Design system partagé — thématisation MLB / NPB / KBO / NHL.
+
+Usage dans chaque app (après `st.set_page_config`) :
+
+    from shared.theme import apply_theme, render_page_header, afficher_cartes_matchs
+    apply_theme("mlb")  # ou "npb" / "kbo" / "nhl"
+"""
+
+from __future__ import annotations
+
+import html
+import re
+import unicodedata
+from pathlib import Path
+from typing import Any, Mapping, Optional
+
+import streamlit as st
+
+# ---------------------------------------------------------------------------
+# Palettes par ligue (couleurs officielles / esthétique de référence)
+# ---------------------------------------------------------------------------
+LEAGUE_THEMES: dict[str, dict[str, str]] = {
+    "mlb": {
+        "label": "MLB",
+        "full_name": "Major League Baseball",
+        "primary": "#0C2340",       # Bleu marine
+        "secondary": "#C8102E",     # Rouge baseball
+        "accent": "#FFFFFF",
+        "on_primary": "#FFFFFF",
+        "bg": "#F3F6FA",
+        "card_bg": "#FFFFFF",
+        "chip_bg": "#EEF3F8",
+        "text": "#152033",
+        "muted": "#5B6B7C",
+        "border": "rgba(12, 35, 64, 0.12)",
+        "success": "#1F7A4D",
+        "danger": "#C8102E",
+        "glow": "rgba(200, 16, 46, 0.12)",
+        "header_grad": "linear-gradient(135deg, #0C2340 0%, #163A5F 58%, #C8102E 130%)",
+    },
+    "npb": {
+        "label": "NPB",
+        "full_name": "Nippon Professional Baseball",
+        "primary": "#111111",       # Noir
+        "secondary": "#E60012",     # Rouge vif japonais
+        "accent": "#FFFFFF",
+        "on_primary": "#FFFFFF",
+        "bg": "#F7F7F8",
+        "card_bg": "#FFFFFF",
+        "chip_bg": "#F2F2F3",
+        "text": "#141414",
+        "muted": "#5C5C5C",
+        "border": "rgba(17, 17, 17, 0.12)",
+        "success": "#1B7A4E",
+        "danger": "#E60012",
+        "glow": "rgba(230, 0, 18, 0.10)",
+        "header_grad": "linear-gradient(135deg, #111111 0%, #2A2A2A 55%, #E60012 125%)",
+    },
+    "kbo": {
+        "label": "KBO",
+        "full_name": "Korea Baseball Organization",
+        "primary": "#0033A0",       # Bleu roi
+        "secondary": "#B0B7C3",     # Argent
+        "accent": "#FFFFFF",
+        "on_primary": "#FFFFFF",
+        "bg": "#F2F5FB",
+        "card_bg": "#FFFFFF",
+        "chip_bg": "#EDF1F8",
+        "text": "#142033",
+        "muted": "#5A6A7D",
+        "border": "rgba(0, 51, 160, 0.13)",
+        "success": "#1F7A4D",
+        "danger": "#E31C23",        # Touche de rouge dynamique
+        "glow": "rgba(0, 51, 160, 0.12)",
+        "header_grad": "linear-gradient(135deg, #0033A0 0%, #1A4BB8 55%, #8E97A8 120%)",
+    },
+    "nhl": {
+        "label": "NHL",
+        "full_name": "National Hockey League",
+        "primary": "#111111",       # Noir glace
+        "secondary": "#CF0A2C",     # Rouge NHL
+        "accent": "#FFFFFF",
+        "on_primary": "#FFFFFF",
+        "bg": "#F4F6F8",
+        "card_bg": "#FFFFFF",
+        "chip_bg": "#ECEFF2",
+        "text": "#121417",
+        "muted": "#5C6570",
+        "border": "rgba(17, 17, 17, 0.12)",
+        "success": "#1F7A4D",
+        "danger": "#CF0A2C",
+        "glow": "rgba(207, 10, 44, 0.12)",
+        "header_grad": "linear-gradient(135deg, #111111 0%, #2B2B2B 52%, #CF0A2C 125%)",
+    },
+    "tennis": {
+        "label": "Tennis",
+        "full_name": "Tennis ATP / WTA",
+        "primary": "#0B3D2E",       # Vert court
+        "secondary": "#E4C65B",     # Jaune balle
+        "accent": "#FFFFFF",
+        "on_primary": "#FFFFFF",
+        "bg": "#F3F7F4",
+        "card_bg": "#FFFFFF",
+        "chip_bg": "#E7F0EA",
+        "text": "#12241C",
+        "muted": "#5A6E63",
+        "border": "rgba(11, 61, 46, 0.14)",
+        "success": "#1F7A4D",
+        "danger": "#B42318",
+        "glow": "rgba(228, 198, 91, 0.18)",
+        "header_grad": "linear-gradient(135deg, #0B3D2E 0%, #145A43 55%, #E4C65B 130%)",
+    },
+}
+
+
+def _css_path() -> Path:
+    return Path(__file__).resolve().parent / "styles.css"
+
+
+def _escape(value: Any) -> str:
+    if value is None:
+        return "—"
+    text = str(value).strip()
+    return html.escape(text) if text else "—"
+
+
+def _inject_css_variables(theme: Mapping[str, str]) -> str:
+    return f"""
+:root {{
+  --ps-primary: {theme['primary']};
+  --ps-secondary: {theme['secondary']};
+  --ps-accent: {theme['accent']};
+  --ps-on-primary: {theme['on_primary']};
+  --ps-bg: {theme['bg']};
+  --ps-card-bg: {theme['card_bg']};
+  --ps-chip-bg: {theme['chip_bg']};
+  --ps-text: {theme['text']};
+  --ps-muted: {theme['muted']};
+  --ps-border: {theme['border']};
+  --ps-success: {theme['success']};
+  --ps-danger: {theme['danger']};
+  --ps-glow: {theme['glow']};
+  --ps-header-grad: {theme['header_grad']};
+}}
+"""
+
+
+def apply_theme(league: str) -> dict[str, str]:
+    """
+    Injecte le CSS partagé + les variables de la ligue.
+    À appeler une seule fois après `st.set_page_config`.
+    Retourne le dict de thème actif.
+    """
+    key = (league or "mlb").strip().lower()
+    if key not in LEAGUE_THEMES:
+        key = "mlb"
+    theme = LEAGUE_THEMES[key]
+    st.session_state["ps_league"] = key
+    st.session_state["ps_theme"] = theme
+
+    css_file = _css_path()
+    base_css = css_file.read_text(encoding="utf-8") if css_file.exists() else ""
+    variables = _inject_css_variables(theme)
+
+    st.markdown(
+        f"<style>\n{variables}\n{base_css}\n</style>",
+        unsafe_allow_html=True,
+    )
+    return theme
+
+
+def get_active_theme() -> dict[str, str]:
+    theme = st.session_state.get("ps_theme")
+    if isinstance(theme, dict):
+        return theme
+    league = st.session_state.get("ps_league", "mlb")
+    return LEAGUE_THEMES.get(league, LEAGUE_THEMES["mlb"])
+
+
+def render_page_header(title: str, tagline: str, league: Optional[str] = None) -> None:
+    """En-tête de page aux couleurs de la ligue (remplace st.title brut)."""
+    key = (league or st.session_state.get("ps_league") or "mlb").lower()
+    theme = LEAGUE_THEMES.get(key, LEAGUE_THEMES["mlb"])
+    st.markdown(
+        f"""
+        <div class="ps-hero">
+          <p class="ps-hero__eyebrow">{_escape(theme['full_name'])}</p>
+          <h1 class="ps-hero__brand">{_escape(title)}</h1>
+          <p class="ps-hero__tagline">{_escape(tagline)}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_section_title(title: str, subtitle: Optional[str] = None) -> None:
+    """Titre de section avec barre d'accent ligue."""
+    st.markdown(
+        f"""
+        <div class="ps-section-title">
+          <span class="ps-section-title__bar"></span>
+          <h2 class="ps-section-title__text">{_escape(title)}</h2>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if subtitle:
+        st.markdown(
+            f'<p class="ps-section-sub">{_escape(subtitle)}</p>',
+            unsafe_allow_html=True,
+        )
+
+
+def badge_html(label: str, kind: str = "status") -> str:
+    """
+    Badge Win / Loss / pending / value / avoid / neutral / status.
+    `kind` accepte aussi les icônes ✅ ❌ ⏳ issues des colonnes Résultat vs Algo.
+    """
+    mapping = {
+        "✅": ("win", "Win"),
+        "❌": ("loss", "Loss"),
+        "⏳": ("pending", "Pending"),
+        "win": ("win", label or "Win"),
+        "loss": ("loss", label or "Loss"),
+        "pending": ("pending", label or "Pending"),
+        "value": ("value", label or "Value Bet"),
+        "medium": ("medium", label or "Value moyenne"),
+        "avoid": ("avoid", label or "Éviter"),
+        "neutral": ("neutral", label or "Juste"),
+        "none": ("ou-nobet", label or "Pas de value"),
+        "status": ("status", label or "Statut"),
+        "evitez": ("avoid", label or "Éviter"),
+        "ou-play": ("ou-play", label or "O/U"),
+        "ou-nobet": ("ou-nobet", label or "NO BET"),
+    }
+    kind_key = (kind or "status").strip()
+    if kind_key in mapping:
+        css_kind, default_label = mapping[kind_key]
+        text = label if label and kind_key not in {"✅", "❌", "⏳"} else default_label
+        if kind_key in {"✅", "❌", "⏳"} and label and label not in {"✅", "❌", "⏳"}:
+            text = label
+        elif kind_key in {"✅", "❌", "⏳"}:
+            text = f"{kind_key} {default_label}"
+    else:
+        css_kind, text = "status", label or kind_key
+    return f'<span class="ps-badge ps-badge--{css_kind}">{_escape(text)}</span>'
+
+
+def _badge_from_result_icon(icon: Any) -> str:
+    raw = (str(icon).strip() if icon is not None else "") or "⏳"
+    if "✅" in raw:
+        return badge_html(raw if len(raw) > 1 else "Favori OK", "win")
+    if "❌" in raw:
+        return badge_html(raw if len(raw) > 1 else "Contre", "loss")
+    return badge_html(raw if len(raw) > 1 else "En attente", "pending")
+
+
+def render_match_card_html(row: Mapping[str, Any]) -> str:
+    """HTML d'une carte match (conservé pour compatibilité / debug)."""
+    match = _escape(row.get("Match", "Match"))
+    statut = _escape(row.get("Statut", "—"))
+    score = _escape(row.get("Score", "—"))
+    total = _escape(row.get("Total Runs", "—"))
+    hrs = _escape(row.get("Home Runs", "—"))
+    comparatif = _escape(row.get("Comparatif Prédiction", "—"))
+    resultat = row.get("Résultat vs Algo", "⏳")
+
+    return f"""
+    <article class="ps-match-card">
+      <div class="ps-match-card__top">
+        <h3 class="ps-match-card__title">{match}</h3>
+        {badge_html(statut, "status")}
+      </div>
+      <p class="ps-match-card__score">{score}</p>
+      <div class="ps-match-card__meta">
+        <div class="ps-match-card__meta-item">
+          <span class="ps-match-card__meta-label">Total Runs</span>
+          <span class="ps-match-card__meta-value">{total}</span>
+        </div>
+        <div class="ps-match-card__meta-item">
+          <span class="ps-match-card__meta-label">Home Runs</span>
+          <span class="ps-match-card__meta-value">{hrs}</span>
+        </div>
+        <div class="ps-match-card__meta-item" style="grid-column: 1 / -1;">
+          <span class="ps-match-card__meta-label">Comparatif Prédiction</span>
+          <span class="ps-match-card__meta-value">{comparatif}</span>
+        </div>
+      </div>
+      <div class="ps-match-card__footer">
+        <span style="color:var(--ps-muted);font-size:0.8rem;font-weight:600;">Résultat vs Algo</span>
+        {_badge_from_result_icon(resultat)}
+      </div>
+    </article>
+    """
+
+
+def _afficher_carte_match_native(row: Mapping[str, Any]) -> None:
+    """Carte match via composants Streamlit natifs (fiable, pas de sanitization HTML)."""
+    with st.container(border=True):
+        col_titre, col_badge = st.columns([3.2, 1.2])
+        with col_titre:
+            st.markdown(f"**{row.get('Match', 'Match')}**")
+        with col_badge:
+            st.markdown(
+                badge_html(str(row.get("Statut", "—")), "status"),
+                unsafe_allow_html=True,
+            )
+
+        score = row.get("Score", "—")
+        st.markdown(
+            f'<p class="ps-match-card__score">{_escape(score)}</p>',
+            unsafe_allow_html=True,
+        )
+
+        # Runs (scoreurs) + Home Runs — même niveau de détail que le tableau
+        runs_val = str(row.get("Total Runs", row.get("Runs", "—")) or "—")
+        hr_val = str(row.get("Home Runs", "—") or "—")
+        st.markdown(
+            f"""
+            <div class="ps-match-card__meta">
+              <div class="ps-match-card__meta-item" style="grid-column: 1 / -1;">
+                <span class="ps-match-card__meta-label">Runs</span>
+                <span class="ps-match-card__meta-value">{_escape(runs_val)}</span>
+              </div>
+              <div class="ps-match-card__meta-item" style="grid-column: 1 / -1;">
+                <span class="ps-match-card__meta-label">Home Runs</span>
+                <span class="ps-match-card__meta-value">{_escape(hr_val)}</span>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.caption(f"Comparatif prédiction : {row.get('Comparatif Prédiction', '—')}")
+        st.markdown(
+            _badge_from_result_icon(row.get("Résultat vs Algo", "⏳")),
+            unsafe_allow_html=True,
+        )
+
+
+def afficher_cartes_matchs(df, *, show_table_fallback: bool = True, column_config=None) -> None:
+    """
+    Affiche le tableau en direct (toujours visible) + des cartes match natives.
+    Le tableau n'est plus masqué dans un expander : c'est la vue principale live.
+    """
+    if df is None or getattr(df, "empty", True):
+        return
+
+    # --- Tableau en direct (vue principale, toujours visible) ---
+    if show_table_fallback:
+        st.markdown(
+            '<p class="ps-section-sub" style="margin:0.2rem 0 0.6rem 0;">'
+            "Tableau en direct — scores, statuts et comparatif algo</p>",
+            unsafe_allow_html=True,
+        )
+        kwargs = {"hide_index": True, "use_container_width": True}
+        if column_config is not None:
+            kwargs["column_config"] = column_config
+        st.dataframe(df, **kwargs)
+
+    # --- Cartes natives (complément visuel, sans HTML fragile) ---
+    with st.expander("🃏 Vue cartes par match", expanded=False):
+        rows = list(df.iterrows())
+        for i in range(0, len(rows), 2):
+            cols = st.columns(2)
+            for j, col in enumerate(cols):
+                idx = i + j
+                if idx >= len(rows):
+                    break
+                with col:
+                    _afficher_carte_match_native(rows[idx][1])
+
+
+def render_prediction_match_banner(title: str, subtitle: str = "") -> None:
+    """
+    Bandeau-carte au-dessus du bloc Prédictions.
+    (Streamlit ne permet pas d'encapsuler des widgets dans un vrai <div> HTML :
+    on stylise donc l'en-tête + les métriques via CSS global.)
+    """
+    sub = f'<p class="ps-card__subtitle">{_escape(subtitle)}</p>' if subtitle else ""
+    st.markdown(
+        f'<div class="ps-card"><h3 class="ps-card__title">{_escape(title)}</h3>{sub}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+# Alias conservés pour compatibilité avec d'éventuels appels existants
+def render_prediction_card_open(title: str, subtitle: str = "") -> None:
+    render_prediction_match_banner(title, subtitle)
+
+
+def render_card_close() -> None:
+    return
+
+
+def afficher_badge_value_bet(niveau: str, message: str) -> None:
+    """Affiche un message Value Bet avec badge coloré (sans changer la logique métier)."""
+    if not message:
+        return
+    kind = {"value": "value", "evitez": "avoid", "juste": "neutral"}.get(niveau, "neutral")
+    label = {"value": "Value Bet", "evitez": "Éviter", "juste": "Cote juste"}.get(niveau, "Info")
+    st.markdown(
+        f'<div class="ps-card" style="padding:0.85rem 1rem;">'
+        f'{badge_html(label, kind)}'
+        f'<p style="margin:0.55rem 0 0 0;color:var(--ps-text);line-height:1.45;">'
+        f'{_escape(message)}</p></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_footer(league_label: str, date_str: str) -> None:
+    st.markdown(
+        f'<div class="ps-footer"><strong>{_escape(league_label)}</strong> Analytics · '
+        f'Données mises à jour : {_escape(date_str)}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def afficher_outil_coherence_totaux(
+    total_match,
+    total_vue_equipe,
+    ligne,
+    code_match=None,
+    code_vue=None,
+) -> None:
+    """
+    Panneau de corrélation Over/Under entre :
+      - projection MATCH (Hot Pronostics) = somme des moyennes offensives des 2 équipes
+      - projection VUE ÉQUIPE (Prédictions du jour) = predire_runs_match (proxy RA + lanceur)
+    Affichage uniquement : ne recalcule aucun modèle.
+    """
+    def _fmt(v):
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):.1f}"
+        except (TypeError, ValueError):
+            return "—"
+
+    aligne = None
+    if code_match and code_vue:
+        aligne = code_match == code_vue
+    elif total_match is not None and total_vue_equipe is not None:
+        try:
+            aligne = abs(float(total_match) - float(total_vue_equipe)) <= 1.0
+        except (TypeError, ValueError):
+            aligne = None
+
+    if aligne is True:
+        statut = "✅ Aligné"
+        detail = (
+            "Les deux vues indiquent le même sens Over/Under (ou des projections "
+            "très proches)."
+        )
+    elif aligne is False:
+        statut = "⚠️ Divergent"
+        detail = (
+            "Écart attendu : Hot Pronostics utilise la somme des moyennes de runs "
+            "marqués des **deux** équipes, alors que la vue équipe ajuste l'attaque "
+            "sélectionnée au lanceur adverse et approxime l'attaque adverse via les "
+            "runs **concédés** par l'équipe choisie."
+        )
+    else:
+        statut = "⚪ Données partielles"
+        detail = "Impossible de comparer les deux projections pour ce match."
+
+    with st.expander(f"🔗 Cohérence Totaux Hot Pronostics ↔ Prédictions — {statut}", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown("**Projection match (Hot)**")
+            st.markdown(f"### {_fmt(total_match)}")
+            st.caption(f"Reco : {code_match or 'N/A'}")
+        with c2:
+            st.markdown("**Projection vue équipe**")
+            st.markdown(f"### {_fmt(total_vue_equipe)}")
+            st.caption(f"Reco : {code_vue or 'N/A'}")
+        with c3:
+            st.markdown("**Ligne saison**")
+            st.markdown(f"### {_fmt(ligne)}")
+            st.caption("Moyenne réelle des totaux")
+        st.caption(detail)
+        st.caption(
+            "La **Recommandation Totaux** affichée ci-dessus suit la projection match "
+            "(même source que le tableau Hot Pronostics), pour éviter les Over/Under "
+            "contradictoires entre onglets."
+        )
+
+
+def afficher_tableau_recap_hot_pronostics(
+    rows: list,
+    *,
+    label_joueurs: str = "Joueurs (HR / Run)",
+    label_primary: str = "💣 HR",
+    label_secondary: str = "🏃 Run",
+    show_ecart: bool = False,
+    show_runs_equipes: bool = False,
+) -> None:
+    """
+    Affiche le tableau de bord Hot Pronostics.
+    Rendu 100% Streamlit natif (pas de <table> HTML).
+
+    `rows` = liste de dicts déjà agrégés (aucune requête ici) :
+      confrontation, heure, favori, favori_pct, value_kind, value_label,
+      ou_kind, ou_resume, reco_hr, reco_hr_detail, reco_run, reco_run_detail
+      (+ option NHL) ecart_kind, ecart_resume
+      (+ option baseball) runs_away, runs_home, runs_away_label, runs_home_label
+    """
+    if not rows:
+        st.info("Aucun match à afficher dans le tableau de bord du jour.")
+        return
+
+    value_emoji = {
+        "value": "🟢",
+        "medium": "🟠",
+        "avoid": "🔴",
+        "none": "⚪",
+    }
+    ou_labels = {
+        "OVER": "🟢 OVER",
+        "UNDER": "🟢 UNDER",
+        "NO_BET": "⚠️ NO BET",
+    }
+
+    def _fmt_runs(v):
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):.1f}"
+        except (TypeError, ValueError):
+            return "—"
+
+    # Colonnes du bandeau (sans Joueurs) : les reco HR/Run passent sous le bandeau
+    # en pleine largeur pour ne plus allonger verticalement la dernière colonne.
+    if show_ecart:
+        widths = [1.0, 1.05, 0.95, 0.95]
+        headers = [
+            "Confrontation",
+            "Vainqueur & Value",
+            "Totaux (O/U)",
+            "Écart de points",
+        ]
+    elif show_runs_equipes:
+        widths = [1.0, 1.05, 0.95, 1.0]
+        headers = [
+            "Confrontation",
+            "Vainqueur & Value",
+            "Totaux (O/U)",
+            "Runs / équipe",
+        ]
+    else:
+        widths = [1.0, 1.15, 1.05]
+        headers = [
+            "Confrontation",
+            "Vainqueur & Value",
+            "Totaux (O/U)",
+        ]
+
+    header_cols = st.columns(widths)
+    for col, title in zip(header_cols, headers):
+        with col:
+            st.markdown(f"**{title}**")
+
+    for row in rows:
+        with st.container(border=True):
+            cols = st.columns(widths)
+            c1, c2, c3 = cols[0], cols[1], cols[2]
+            c_extra = cols[3] if (show_ecart or show_runs_equipes) else None
+
+            with c1:
+                st.markdown(f"**{row.get('confrontation') or '—'}**")
+                st.caption(str(row.get("heure") or "—"))
+
+            with c2:
+                favori = row.get("favori")
+                pct = row.get("favori_pct")
+                if favori:
+                    try:
+                        favori_txt = f"{favori} ({float(pct):.0f}%)" if pct is not None else str(favori)
+                    except (TypeError, ValueError):
+                        favori_txt = str(favori)
+                else:
+                    favori_txt = "Non disponible"
+                st.markdown(f"**{favori_txt}**")
+                emoji = value_emoji.get(row.get("value_kind") or "none", "⚪")
+                st.caption(f"{emoji} {row.get('value_label') or 'Pas de value'}")
+
+            with c3:
+                ou_kind = row.get("ou_kind")
+                st.markdown(f"**{ou_labels.get(ou_kind, '⚪ N/A')}**")
+                st.caption(str(row.get("ou_resume") or "Projection indisponible"))
+
+            if c_extra is not None:
+                with c_extra:
+                    if show_ecart:
+                        ecart_kind = row.get("ecart_kind")
+                        st.markdown(
+                            f"**{ou_labels.get(ecart_kind, row.get('ecart_label') or '⚪ N/A')}**"
+                        )
+                        st.caption(str(row.get("ecart_resume") or "Écart indisponible"))
+                    else:
+                        away_lab = row.get("runs_away_label") or "Ext"
+                        home_lab = row.get("runs_home_label") or "Dom"
+                        st.markdown(
+                            f"**{away_lab} :** {_fmt_runs(row.get('runs_away'))}"
+                        )
+                        st.markdown(
+                            f"**{home_lab} :** {_fmt_runs(row.get('runs_home'))}"
+                        )
+                        st.caption("Moy. runs (10 derniers)")
+
+            # Bloc joueurs sous les colonnes (pleine largeur)
+            st.markdown(f"**{label_joueurs}**")
+            reco_hr = row.get("reco_hr") or "—"
+            reco_run = row.get("reco_run") or "—"
+            st.markdown(f"**{label_primary} :** {reco_hr}")
+            if row.get("reco_hr_detail"):
+                st.caption(str(row["reco_hr_detail"]))
+            st.markdown(f"**{label_secondary} :** {reco_run}")
+            if row.get("reco_run_detail"):
+                st.caption(str(row["reco_run_detail"]))
+
+
+def _extraire_n_question_hot(question: str, defaut: int = 3) -> int:
+    """Extrait un top-N depuis une question en français (chiffres ou lettres)."""
+    q = (question or "").lower()
+    # Typo fréquente : "rois" pour "trois"
+    q = q.replace("rois joueurs", "trois joueurs").replace("rois ", "trois ")
+    m = re.search(r"\btop\s*(\d{1,2})\b", q)
+    if m:
+        return max(1, min(10, int(m.group(1))))
+    m = re.search(r"\b(\d{1,2})\s*(?:joueurs?|meilleurs?|favoris?|candidats?)\b", q)
+    if m:
+        return max(1, min(10, int(m.group(1))))
+    mots = {
+        "un": 1, "une": 1, "deux": 2, "trois": 3, "quatre": 4, "cinq": 5,
+        "six": 6, "sept": 7, "huit": 8, "neuf": 9, "dix": 10,
+    }
+    for mot, n in mots.items():
+        if re.search(rf"\b{mot}\b", q):
+            return n
+    return defaut
+
+
+def _normaliser_texte_question(texte: str) -> str:
+    brut = unicodedata.normalize("NFKD", texte or "")
+    brut = "".join(c for c in brut if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", brut.lower()).strip()
+
+
+def repondre_question_hot_pronostics(
+    question: str,
+    df_hr_all,
+    df_runs_all,
+    df_victoires,
+    lignes_recap: list | None = None,
+) -> str:
+    """
+    Répond à une question libre à partir des tableaux Hot Pronostics déjà calculés.
+    Pas de LLM : intention détectée par mots-clés (HR / Run / favoris / O-U).
+    Ne modifie aucun algorithme de prédiction — lecture seule des DataFrames.
+    """
+    q_raw = (question or "").strip()
+    if not q_raw:
+        return "Écris une question, par exemple : « Donne-moi les 3 joueurs les plus susceptibles de marquer un HR »."
+
+    q = _normaliser_texte_question(q_raw)
+    n = _extraire_n_question_hot(q_raw, defaut=3)
+
+    # Filtre équipe optionnel (si un nom d'équipe du jour apparaît dans la question)
+    equipes = set()
+    for df in (df_hr_all, df_runs_all):
+        if df is not None and hasattr(df, "empty") and not df.empty and "Équipe" in df.columns:
+            equipes.update(str(x) for x in df["Équipe"].dropna().unique())
+    if df_victoires is not None and hasattr(df_victoires, "empty") and not df_victoires.empty:
+        for col in ("Équipe Domicile", "Équipe Extérieur"):
+            if col in df_victoires.columns:
+                equipes.update(str(x) for x in df_victoires[col].dropna().unique())
+
+    equipe_filtre = None
+    for nom in sorted(equipes, key=len, reverse=True):
+        if _normaliser_texte_question(nom) and _normaliser_texte_question(nom) in q:
+            equipe_filtre = nom
+            break
+
+    veut_hr = any(k in q for k in (
+        "hr", "home run", "homerun", "circuit", "slugger", "coups de circuit", "coup de circuit",
+    ))
+    # "marquer" seul penche runs, sauf si HR déjà détecté
+    veut_run = (not veut_hr) and any(k in q for k in (
+        "run", "marquer", "scoreur", "points", "obp",
+    ))
+    # Favoris / win-lose : mots explicites uniquement (évite que "probabilité"
+    # dans une question HR déclenche aussi les favoris).
+    veut_victoire = any(k in q for k in (
+        "victoire", "vainqueur", "favori", "favoris", "qui gagne", "win/lose",
+        "win lose", "probabilite de victoire", "proba de victoire",
+    ))
+    veut_ou = any(k in q for k in (
+        "over", "under", "o/u", "ou ", "total", "totaux", "ligne",
+    ))
+
+    # Si rien de clair : défaut HR (cas le plus demandé)
+    if not any((veut_hr, veut_run, veut_victoire, veut_ou)):
+        if "joueur" in q or "probab" in q or "susceptible" in q:
+            veut_hr = True
+        else:
+            return (
+                "Je n'ai pas bien cerné la question. Tu peux demander par exemple :\n"
+                "- les 3 joueurs les plus susceptibles de marquer un **HR**\n"
+                "- les 5 meilleurs candidats **runs**\n"
+                "- les **favoris** du jour\n"
+                "- les matchs plutôt **Over** / **Under**"
+            )
+
+    # Question joueur (HR/Run) : ne pas ajouter les favoris en plus
+    if (veut_hr or veut_run) and not any(k in q for k in (
+        "favori", "favoris", "vainqueur", "qui gagne", "victoire",
+    )):
+        veut_victoire = False
+
+    parties = []
+
+    if veut_hr:
+        df = df_hr_all
+        if df is None or getattr(df, "empty", True):
+            parties.append("Aucun candidat HR disponible pour le moment (lineups souvent absentes tôt dans la journée).")
+        else:
+            sous = df
+            if equipe_filtre and "Équipe" in sous.columns:
+                sous = sous[sous["Équipe"].astype(str) == equipe_filtre]
+            sous = sous.head(n)
+            if sous.empty:
+                parties.append(f"Aucun candidat HR trouvé pour {equipe_filtre}." if equipe_filtre else "Aucun candidat HR.")
+            else:
+                titre = f"**Top {len(sous)} HR**"
+                if equipe_filtre:
+                    titre += f" — {equipe_filtre}"
+                lignes = [titre + " (indice Hot Pronostics du jour) :"]
+                for i in range(len(sous)):
+                    row = sous.iloc[i]
+                    try:
+                        indice_txt = f"{float(row.get('Indice HR (/100)')):.0f}/100"
+                    except (TypeError, ValueError):
+                        indice_txt = "—"
+                    lignes.append(
+                        f"{i + 1}. **{row.get('Joueur', '?')}** "
+                        f"({row.get('Équipe', '?')} vs {row.get('Adversaire', '?')}) — indice {indice_txt}"
+                    )
+                parties.append("\n".join(lignes))
+
+    if veut_run:
+        df = df_runs_all
+        if df is None or getattr(df, "empty", True):
+            parties.append("Aucun candidat Run disponible pour le moment.")
+        else:
+            sous = df
+            if equipe_filtre and "Équipe" in sous.columns:
+                sous = sous[sous["Équipe"].astype(str) == equipe_filtre]
+            sous = sous.head(n)
+            if sous.empty:
+                parties.append(f"Aucun candidat Run trouvé pour {equipe_filtre}." if equipe_filtre else "Aucun candidat Run.")
+            else:
+                titre = f"**Top {len(sous)} Runs**"
+                if equipe_filtre:
+                    titre += f" — {equipe_filtre}"
+                lignes = [titre + " (indice Hot Pronostics du jour) :"]
+                for i in range(len(sous)):
+                    row = sous.iloc[i]
+                    try:
+                        indice_txt = f"{float(row.get('Indice Run (/100)')):.0f}/100"
+                    except (TypeError, ValueError):
+                        indice_txt = "—"
+                    lignes.append(
+                        f"{i + 1}. **{row.get('Joueur', '?')}** "
+                        f"({row.get('Équipe', '?')} vs {row.get('Adversaire', '?')}) — indice {indice_txt}"
+                    )
+                parties.append("\n".join(lignes))
+
+    if veut_victoire:
+        df = df_victoires
+        if df is None or getattr(df, "empty", True):
+            parties.append("Aucune probabilité de victoire disponible.")
+        else:
+            favoris = []
+            for _, row in df.iterrows():
+                home = row.get("Équipe Domicile")
+                away = row.get("Équipe Extérieur")
+                ph = row.get("Proba Domicile (%)")
+                pa = row.get("Proba Extérieur (%)")
+                try:
+                    ph_f, pa_f = float(ph), float(pa)
+                except (TypeError, ValueError):
+                    continue
+                if equipe_filtre and equipe_filtre not in (home, away):
+                    continue
+                if ph_f >= pa_f:
+                    favoris.append((ph_f, home, away, ph_f, "domicile"))
+                else:
+                    favoris.append((pa_f, away, home, pa_f, "extérieur"))
+            favoris.sort(key=lambda x: x[0], reverse=True)
+            favoris = favoris[:n]
+            if not favoris:
+                parties.append("Aucun favori trouvé pour ce filtre.")
+            else:
+                lignes = [f"**Top {len(favoris)} favoris** du jour :"]
+                for i, (pct, fav, adv, _, cote) in enumerate(favoris, 1):
+                    lignes.append(f"{i}. **{fav}** ({pct:.1f}%) vs {adv} — côté {cote}")
+                parties.append("\n".join(lignes))
+
+    if veut_ou and lignes_recap:
+        overs, unders, nobet = [], [], []
+        for row in lignes_recap:
+            kind = (row.get("ou_kind") or "").upper()
+            conf = row.get("confrontation") or "?"
+            resume = row.get("ou_resume") or ""
+            if equipe_filtre:
+                conf_n = _normaliser_texte_question(str(conf))
+                if _normaliser_texte_question(equipe_filtre) not in conf_n:
+                    continue
+            item = f"**{conf}** — {resume}" if resume else f"**{conf}**"
+            if kind == "OVER":
+                overs.append(item)
+            elif kind == "UNDER":
+                unders.append(item)
+            else:
+                nobet.append(item)
+        blocs = ["**Totaux (O/U)** du tableau de bord :"]
+        if overs:
+            blocs.append("🟢 Over :\n- " + "\n- ".join(overs[:n]))
+        if unders:
+            blocs.append("🟢 Under :\n- " + "\n- ".join(unders[:n]))
+        if not overs and not unders:
+            blocs.append("Pas de signal Over/Under clair (NO BET) sur les matchs filtrés.")
+            if nobet:
+                blocs.append("- " + "\n- ".join(nobet[:n]))
+        parties.append("\n\n".join(blocs))
+    elif veut_ou:
+        parties.append("Les totaux O/U ne sont pas chargés pour cette question.")
+
+    parties.append(
+        "\n_Réponse basée uniquement sur les indices Hot Pronostics du jour "
+        "(heuristiques, pas une garantie de résultat)._"
+    )
+    return "\n\n".join(parties)
+
+
+def afficher_tableau_recap_hot_pronostics_tennis(rows: list) -> None:
+    """
+    Tableau Hot Pronostics tennis — 2 values uniquement :
+      1) Victoire (favori + %)
+      2) Les deux gagnent un set (Oui / Non + %)
+    """
+    if not rows:
+        st.info("Aucun match à afficher dans le tableau de bord du jour.")
+        return
+
+    widths = [1.3, 1.1, 1.1]
+    headers = ["Confrontation", "Victoire", "Les 2 gagnent un set"]
+    header_cols = st.columns(widths)
+    for col, title in zip(header_cols, headers):
+        with col:
+            st.markdown(f"**{title}**")
+
+    for row in rows:
+        with st.container(border=True):
+            c1, c2, c3 = st.columns(widths)
+            with c1:
+                st.markdown(f"**{row.get('confrontation') or '—'}**")
+                meta = " · ".join(
+                    x for x in (
+                        row.get("heure"),
+                        row.get("tournoi"),
+                        row.get("tableau"),
+                        row.get("statut"),
+                    ) if x
+                )
+                if meta:
+                    st.caption(meta)
+            with c2:
+                favori = row.get("favori")
+                pct = row.get("favori_pct")
+                if favori:
+                    try:
+                        txt = f"{favori} ({float(pct):.0f}%)" if pct is not None else str(favori)
+                    except (TypeError, ValueError):
+                        txt = str(favori)
+                else:
+                    txt = "Non disponible"
+                st.markdown(f"**🎾 {txt}**")
+                if row.get("victoire_detail"):
+                    st.caption(str(row["victoire_detail"]))
+            with c3:
+                kind = (row.get("sets_kind") or "").upper()
+                emoji = "🟢" if kind == "OUI" else ("🔴" if kind == "NON" else "⚪")
+                label = row.get("sets_label") or kind or "—"
+                st.markdown(f"**{emoji} {label}**")
+                if row.get("sets_detail"):
+                    st.caption(str(row["sets_detail"]))
+
+
+def afficher_assistant_hot_pronostics_tennis(
+    lignes_recap: list | None,
+    *,
+    key_prefix: str = "tennis_hot",
+) -> None:
+    """Boîte de questions tennis (victoire / les 2 gagnent un set)."""
+    st.subheader("💬 Pose une question")
+    st.caption(
+        "Exemples : « Qui est le plus gros favori du jour ? », "
+        "« Dans quels matchs les deux devraient gagner un set ? », "
+        "« Donne-moi les 3 meilleurs favoris »."
+    )
+
+    input_key = f"{key_prefix}_input_question"
+    exemples = [
+        "Qui est le plus gros favori du jour ?",
+        "Donne-moi les 3 meilleurs favoris",
+        "Dans quels matchs les deux devraient gagner un set ?",
+        "Quels matchs sont plutôt en straight sets ?",
+    ]
+    cols = st.columns(2)
+    for i, ex in enumerate(exemples):
+        with cols[i % 2]:
+            if st.button(ex, key=f"{key_prefix}_ex_{i}", use_container_width=True):
+                st.session_state[input_key] = ex
+                st.session_state[f"{key_prefix}_question"] = ex
+                st.session_state[f"{key_prefix}_auto"] = True
+
+    question = st.text_input(
+        "Ta question",
+        placeholder="Ex. : Donne-moi les 3 meilleurs favoris du jour…",
+        key=input_key,
+    )
+    envoyer = st.button("Obtenir la réponse", type="primary", key=f"{key_prefix}_btn_send")
+    if envoyer and question:
+        st.session_state[f"{key_prefix}_question"] = question
+        st.session_state[f"{key_prefix}_auto"] = True
+
+    q = st.session_state.get(f"{key_prefix}_question") or question
+    if st.session_state.get(f"{key_prefix}_auto") and q:
+        with st.container(border=True):
+            st.markdown(repondre_question_hot_pronostics_tennis(q, lignes_recap or []))
+
+
+def repondre_question_hot_pronostics_tennis(question: str, lignes_recap: list) -> str:
+    """Réponse lecture seule à partir du tableau tennis du jour."""
+    q_raw = (question or "").strip()
+    if not q_raw:
+        return "Écris une question sur les favoris ou les sets du jour."
+    if not lignes_recap:
+        return "Aucun match chargé pour répondre."
+
+    q = _normaliser_texte_question(q_raw)
+    n = _extraire_n_question_hot(q_raw, defaut=3)
+
+    veut_sets_oui = any(k in q for k in (
+        "gagnent un set", "gagnent un sete", "both set", "deux sets", "2 sets",
+        "les deux", "set chacun", "au moins un set",
+    )) and "straight" not in q and "2-0" not in q and "straight sets" not in q
+    veut_straight = any(k in q for k in (
+        "straight", "2-0", "deux sets a zero", "sans perdre de set", "sec",
+    ))
+    veut_favori = any(k in q for k in (
+        "favori", "favoris", "victoire", "gagner", "qui gagne", "proba",
+    )) or (not veut_sets_oui and not veut_straight)
+
+    lignes = list(lignes_recap)
+    parties = []
+
+    if veut_favori and not veut_sets_oui and not veut_straight:
+        tries = []
+        for row in lignes:
+            try:
+                pct = float(row.get("favori_pct"))
+            except (TypeError, ValueError):
+                continue
+            tries.append((pct, row))
+        tries.sort(key=lambda x: x[0], reverse=True)
+        top = tries[:n]
+        if not top:
+            parties.append("Aucun favori disponible.")
+        else:
+            out = [f"**Top {len(top)} favoris** du jour :"]
+            for i, (pct, row) in enumerate(top, 1):
+                out.append(
+                    f"{i}. **{row.get('favori')}** ({pct:.0f}%) — "
+                    f"{row.get('confrontation')} ({row.get('tournoi') or 'Tournoi'})"
+                )
+            parties.append("\n".join(out))
+
+    if veut_sets_oui or (not veut_favori and not veut_straight and "set" in q):
+        oui = [r for r in lignes if (r.get("sets_kind") or "").upper() == "OUI"]
+        oui.sort(key=lambda r: float(r.get("sets_pct") or 0), reverse=True)
+        top = oui[:n]
+        if not top:
+            parties.append("Aucun match classé « les 2 gagnent un set » pour le moment.")
+        else:
+            out = [f"**Top {len(top)} matchs** où les deux devraient gagner un set :"]
+            for i, row in enumerate(top, 1):
+                try:
+                    pct = f"{float(row.get('sets_pct')):.0f}%"
+                except (TypeError, ValueError):
+                    pct = "—"
+                out.append(f"{i}. **{row.get('confrontation')}** — {pct} ({row.get('tournoi') or ''})")
+            parties.append("\n".join(out))
+
+    if veut_straight:
+        non = [r for r in lignes if (r.get("sets_kind") or "").upper() == "NON"]
+        non.sort(key=lambda r: float(r.get("sets_pct") or 100))
+        top = non[:n]
+        if not top:
+            parties.append("Aucun match clairement orienté straight sets.")
+        else:
+            out = [f"**Top {len(top)} matchs** plutôt straight sets (un seul joueur prend tous les sets) :"]
+            for i, row in enumerate(top, 1):
+                out.append(
+                    f"{i}. **{row.get('confrontation')}** — favori "
+                    f"**{row.get('favori')}** ({row.get('favori_pct')}%)"
+                )
+            parties.append("\n".join(out))
+
+    parties.append(
+        "\n_Réponse basée uniquement sur les indices Hot Pronostics tennis du jour "
+        "(heuristiques, pas une garantie)._"
+    )
+    return "\n\n".join(parties)
+
+
+def afficher_assistant_hot_pronostics(
+    df_hr_all,
+    df_runs_all,
+    df_victoires,
+    lignes_recap: list | None = None,
+    *,
+    key_prefix: str = "hot",
+) -> None:
+    """
+    Boîte de question dans l'onglet Hot Pronostics.
+    L'utilisateur pose une question en français ; la réponse lit les DataFrames du jour.
+    """
+    st.subheader("💬 Pose une question")
+    st.caption(
+        "Exemples : « Donne-moi les 3 joueurs les plus susceptibles de marquer un HR », "
+        "« Qui a le plus de chances de marquer un run ? », « Quels sont les favoris du jour ? »."
+    )
+
+    input_key = f"{key_prefix}_input_question"
+    exemples = [
+        "Donne-moi les 3 joueurs les plus susceptibles de marquer un HR",
+        "Quels sont les 5 meilleurs candidats pour marquer un run ?",
+        "Quels sont les favoris du jour ?",
+        "Quels matchs sont plutôt Over ?",
+    ]
+    cols = st.columns(2)
+    for i, ex in enumerate(exemples):
+        with cols[i % 2]:
+            if st.button(ex, key=f"{key_prefix}_ex_{i}", use_container_width=True):
+                st.session_state[input_key] = ex
+                st.session_state[f"{key_prefix}_question"] = ex
+                st.session_state[f"{key_prefix}_auto"] = True
+
+    question = st.text_input(
+        "Ta question",
+        placeholder="Ex. : Donne-moi les 3 joueurs susceptibles de marquer des HR…",
+        key=input_key,
+    )
+    envoyer = st.button("Obtenir la réponse", type="primary", key=f"{key_prefix}_btn_send")
+
+    if envoyer and question:
+        st.session_state[f"{key_prefix}_question"] = question
+        st.session_state[f"{key_prefix}_auto"] = True
+
+    q = st.session_state.get(f"{key_prefix}_question") or question
+    if st.session_state.get(f"{key_prefix}_auto") and q:
+        with st.container(border=True):
+            st.markdown(
+                repondre_question_hot_pronostics(
+                    q, df_hr_all, df_runs_all, df_victoires, lignes_recap
+                )
+            )
+
+
+def ensure_shared_on_path(app_file: str) -> None:
+    """
+    Ajoute au `sys.path` le dossier parent qui contient `shared/`.
+    Cherche d'abord à côté de l'app, puis au niveau monorepo (parent).
+    """
+    import sys
+
+    here = Path(app_file).resolve().parent
+    for base in (here, here.parent):
+        if (base / "shared" / "theme.py").is_file():
+            base_str = str(base)
+            if base_str not in sys.path:
+                sys.path.insert(0, base_str)
+            return

@@ -523,56 +523,49 @@ def construire_donnees_hot_pronostics_tennis(cache_bust: int = 0):
             f"{'match équilibré attendu' if sets_kind == 'OUI' else 'écart important → straight sets probable'}"
         )
 
-        # Match déjà terminé : on fige l'affichage sur le réel pour la lecture,
-        # tout en gardant la prédiction en détail.
+        # Hot Pronostics = toujours la PRÉDICTION. Si le match est terminé, on
+        # ajoute le résultat réel en détail (sans écraser favori / %).
         statut = m.get("statut") or "—"
+        detail_victoire_txt = " · ".join(detail_victoire)
+        detail_sets_txt = detail_sets
+        sets_kind_aff, sets_label_aff, sets_pct_aff = sets_kind, sets_label, sets_pct
+
         if m.get("termine"):
-            if m.get("joueur1_sets") > 0 and m.get("joueur2_sets") > 0:
-                sets_kind_reel, sets_label_reel = "OUI", "OUI (résultat)"
-            elif m.get("joueur1_sets") + m.get("joueur2_sets") > 0:
-                sets_kind_reel, sets_label_reel = "NON", "NON (résultat)"
-            else:
-                sets_kind_reel, sets_label_reel = sets_kind, sets_label
             vainqueur_reel = m["joueur1"] if m.get("joueur1_winner") else (
-                m["joueur2"] if m.get("joueur2_winner") else favori
+                m["joueur2"] if m.get("joueur2_winner") else "—"
             )
-            lignes.append({
-                "confrontation": f"{m['joueur1']} vs {m['joueur2']}",
-                "heure": m.get("heure_paris") or "—",
-                "tournoi": m.get("tournoi"),
-                "tableau": m.get("tableau"),
-                "statut": statut,
-                "favori": vainqueur_reel,
-                "favori_pct": favori_pct,
-                "victoire_detail": f"Prédit : {favori} ({favori_pct:.0f}%) · " + " · ".join(detail_victoire),
-                "sets_kind": sets_kind_reel,
-                "sets_label": sets_label_reel,
-                "sets_pct": sets_pct,
-                "sets_detail": f"Prédit : {sets_label} · {detail_sets}",
-                "proba_j1": p1,
-                "proba_j2": p2,
-                "joueur1": m["joueur1"],
-                "joueur2": m["joueur2"],
-            })
-        else:
-            lignes.append({
-                "confrontation": f"{m['joueur1']} vs {m['joueur2']}",
-                "heure": m.get("heure_paris") or "—",
-                "tournoi": m.get("tournoi"),
-                "tableau": m.get("tableau"),
-                "statut": statut,
-                "favori": favori,
-                "favori_pct": favori_pct,
-                "victoire_detail": " · ".join(detail_victoire),
-                "sets_kind": sets_kind,
-                "sets_label": sets_label,
-                "sets_pct": sets_pct,
-                "sets_detail": detail_sets,
-                "proba_j1": p1,
-                "proba_j2": p2,
-                "joueur1": m["joueur1"],
-                "joueur2": m["joueur2"],
-            })
+            ok_victoire = (vainqueur_reel == favori)
+            detail_victoire_txt = (
+                f"Résultat : {vainqueur_reel} "
+                f"({'✅' if ok_victoire else '❌'} vs prédit {favori}) · "
+                + detail_victoire_txt
+            )
+            both_sets_reel = m.get("joueur1_sets", 0) > 0 and m.get("joueur2_sets", 0) > 0
+            if m.get("joueur1_sets", 0) + m.get("joueur2_sets", 0) > 0:
+                ok_sets = (sets_kind == "OUI") == both_sets_reel
+                detail_sets_txt = (
+                    f"Résultat : {'OUI' if both_sets_reel else 'NON'} "
+                    f"({'✅' if ok_sets else '❌'}) · {detail_sets}"
+                )
+
+        lignes.append({
+            "confrontation": f"{m['joueur1']} vs {m['joueur2']}",
+            "heure": m.get("heure_paris") or "—",
+            "tournoi": m.get("tournoi"),
+            "tableau": m.get("tableau"),
+            "statut": statut,
+            "favori": favori,
+            "favori_pct": favori_pct,
+            "victoire_detail": detail_victoire_txt,
+            "sets_kind": sets_kind_aff,
+            "sets_label": sets_label_aff,
+            "sets_pct": sets_pct_aff,
+            "sets_detail": detail_sets_txt,
+            "proba_j1": p1,
+            "proba_j2": p2,
+            "joueur1": m["joueur1"],
+            "joueur2": m["joueur2"],
+        })
 
     return cibles, lignes, date_ref
 

@@ -191,11 +191,35 @@ def _extraire_matchs_depuis_scoreboard(data: dict, ligue_slug: str) -> list[dict
                 if len(competitors) < 2:
                     continue
                 c1, c2 = competitors[0], competitors[1]
-                a1 = (c1.get("athlete") or {})
-                a2 = (c2.get("athlete") or {})
-                # Doubles ESPN : type team / displayName
-                nom1 = a1.get("displayName") or c1.get("displayName") or c1.get("name") or "?"
-                nom2 = a2.get("displayName") or c2.get("displayName") or c2.get("name") or "?"
+
+                def _nom_competiteur(comp_side: dict) -> str:
+                    """Singles : athlete.displayName. Doubles ESPN : roster.displayName."""
+                    ath = comp_side.get("athlete") or {}
+                    roster = comp_side.get("roster") or {}
+                    for candidat in (
+                        ath.get("displayName"),
+                        ath.get("fullName"),
+                        roster.get("displayName"),
+                        roster.get("shortDisplayName"),
+                        comp_side.get("displayName"),
+                        comp_side.get("name"),
+                        comp_side.get("abbreviation"),
+                    ):
+                        if candidat and str(candidat).strip() and str(candidat).strip() != "?":
+                            return str(candidat).strip()
+                    # Repli : concatène les athlètes du roster (doubles)
+                    athletes = roster.get("athletes") or []
+                    noms = [
+                        (a.get("displayName") or a.get("shortName") or "").strip()
+                        for a in athletes
+                        if (a.get("displayName") or a.get("shortName"))
+                    ]
+                    if noms:
+                        return " / ".join(noms)
+                    return "?"
+
+                nom1 = _nom_competiteur(c1)
+                nom2 = _nom_competiteur(c2)
                 statut = ((comp.get("status") or {}).get("type") or {})
                 date_iso = comp.get("date") or comp.get("startDate") or event.get("date")
                 heure_paris = ""
@@ -207,8 +231,22 @@ def _extraire_matchs_depuis_scoreboard(data: dict, ligue_slug: str) -> list[dict
                         date_paris = dt.strftime("%Y-%m-%d")
                     except Exception:
                         pass
+                # ESPN expose souvent periods=5 même en best-of-3 (Masters 1000).
+                # On force Bo3 hors Grands Chelems / Coupe Davis-like.
+                tournoi_l = (tournoi or "").lower()
+                est_grand_chelem = any(
+                    x in tournoi_l for x in (
+                        "australian open", "roland garros", "french open",
+                        "wimbledon", "us open",
+                    )
+                )
                 periods = ((comp.get("format") or {}).get("regulation") or {}).get("periods")
-                best_of = int(periods) if periods else (5 if "mens-singles" in slug_tab else 3)
+                if est_grand_chelem and "mens-singles" in slug_tab:
+                    best_of = 5
+                elif periods in (3, 5) and est_grand_chelem:
+                    best_of = int(periods)
+                else:
+                    best_of = 3
                 note = ""
                 if comp.get("notes"):
                     note = (comp["notes"][0] or {}).get("text") or ""
@@ -583,6 +621,7 @@ apply_theme("tennis")
 render_page_header(
     "Tennis Stats",
     "Résumé du jour & Hot Pronostics — ATP / WTA, tous championnats",
+    league="tennis",
 )
 
 with st.sidebar:
@@ -633,7 +672,7 @@ with onglets[0]:
             st.dataframe(
                 df_resume,
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
                 column_config={
                     "Heure": st.column_config.TextColumn("Heure", width="small"),
                     "Tournoi": st.column_config.TextColumn("Tournoi", width="medium"),
@@ -695,4 +734,4 @@ with onglets[1]:
                     """
                 )
 
-render_footer("Tennis Stats")
+render_footer("Tennis", datetime.now(TZ_PARIS).strftime("%d/%m/%Y %H:%M") + " Paris")

@@ -407,16 +407,16 @@ def _extraire_matchs_depuis_scoreboard(data: dict, ligue_slug: str) -> list[dict
 
 
 @st.cache_data(show_spinner=False, ttl=180)
-def obtenir_matchs_tennis_du_jour(cache_bust: int = 0, _cache_version: int = 4) -> tuple[list[dict], str]:
+def obtenir_matchs_tennis_du_jour(cache_bust: int = 0, _cache_version: int = 5) -> tuple[list[dict], str]:
     """
-    Agrège les matchs de la journée tennis (heure de Paris), tous championnats ESPN.
-    Inclut : date Paris = aujourd'hui, plus les matchs encore en cours / à venir
-    démarrés la veille (sessions Nord-Amérique qui débordent après minuit Paris).
+    Agrège les matchs du jour calendaire Paris uniquement : de 00:00 à 23:59
+    (heure de Paris), tous championnats ESPN. Aucun match de la veille.
     """
     del cache_bust, _cache_version
     maintenant = datetime.now(TZ_PARIS)
     aujourdhui = maintenant.strftime("%Y-%m-%d")
-    hier = (maintenant - timedelta(days=1)).strftime("%Y-%m-%d")
+    debut_jour = maintenant.replace(hour=0, minute=0, second=0, microsecond=0)
+    fin_jour = maintenant.replace(hour=23, minute=59, second=59, microsecond=999999)
     vus = set()
     matchs = []
     for ligue in LIGUES_ESPN:
@@ -425,17 +425,20 @@ def obtenir_matchs_tennis_du_jour(cache_bust: int = 0, _cache_version: int = 4) 
         except Exception:
             continue
         for m in _extraire_matchs_depuis_scoreboard(data, ligue):
-            date_m = m.get("date_paris") or ""
-            state = m.get("state") or ""
-            if date_m == aujourdhui:
-                garder = True
-            elif date_m == hier and state in ("in", "pre", "post"):
-                # Session US : encore live, à venir, ou déjà finie après minuit Paris
-                # (nécessaire pour le tableau de validation des confrontations terminées).
-                garder = True
-            else:
-                garder = False
-            if not garder:
+            # Fenêtre stricte : minuit → 23:59 heure de Paris le jour même
+            date_iso = m.get("date_iso") or ""
+            dt_paris = None
+            if date_iso:
+                try:
+                    dt_paris = datetime.fromisoformat(
+                        date_iso.replace("Z", "+00:00")
+                    ).astimezone(TZ_PARIS)
+                except Exception:
+                    dt_paris = None
+            if dt_paris is not None:
+                if not (debut_jour <= dt_paris <= fin_jour):
+                    continue
+            elif (m.get("date_paris") or "") != aujourdhui:
                 continue
             cle = (m["match_id"], m["joueur1"], m["joueur2"])
             if cle in vus:

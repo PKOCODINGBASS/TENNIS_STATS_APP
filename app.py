@@ -67,11 +67,137 @@ ANNEE_COURANTE = datetime.now(TZ_PARIS).year
 # on déduplique ensuite). Ajouter d'autres slugs s'ils répondent 200.
 LIGUES_ESPN = ("all", "atp", "wta")
 
+# Instantanés Hot Pronostics figés dès le début du match (fichier local).
+NOM_FICHIER_HISTORIQUE = "historique_predictions_tennis.json"
+CHEMIN_HISTORIQUE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), NOM_FICHIER_HISTORIQUE
+)
+
 _SESSION = requests.Session()
 _SESSION.headers.update({
     "User-Agent": "PARIS-SPORTIFS-Tennis-Stats-App/1.0",
     "Accept": "application/json",
 })
+
+
+def _match_a_commence_tennis(match_ou_statut) -> bool:
+    """True dès que le match n'est plus en pré-match (Scheduled / Delayed Start…)."""
+    if isinstance(match_ou_statut, dict):
+        state = (match_ou_statut.get("state") or "").strip().lower()
+        statut = (match_ou_statut.get("statut") or "").strip().lower()
+    else:
+        state, statut = "", (match_ou_statut or "").strip().lower()
+    if state in ("in", "post"):
+        return True
+    if state == "pre":
+        return False
+    if any(x in statut for x in (
+        "scheduled", "pre-game", "preview", "warmup", "delayed start",
+        "postponed", "cancelled", "canceled", "à venir",
+    )):
+        return False
+    if any(x in statut for x in (
+        "in progress", "live", "final", "game over", "retired", "walkover",
+        "completed", "en cours", "suspend",
+    )):
+        return True
+    return False
+
+
+def _cle_snapshot_tennis(m: dict) -> str:
+    mid = m.get("match_id")
+    if mid:
+        return f"id:{mid}"
+    return f"p:{_normaliser_nom(m.get('joueur1') or '')}|{_normaliser_nom(m.get('joueur2') or '')}|{m.get('date_paris') or ''}"
+
+
+def _charger_historique_predictions_tennis() -> dict:
+    try:
+        with open(CHEMIN_HISTORIQUE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _index_snapshots_tennis(matches: list) -> dict:
+    out = {}
+    for m in matches or []:
+        if isinstance(m, dict):
+            out[_cle_snapshot_tennis(m)] = m
+    return out
+
+
+def _fusionner_snapshots_figes_tennis(existants: list, nouveaux: list, maintenant_iso: str) -> list:
+    """
+    Conserve la dernière prédiction pré-match dès que le match a commencé.
+    Les matchs encore à venir restent rafraîchis.
+    """
+    index_old = _index_snapshots_tennis(existants)
+    merges, vus = [], set()
+    for m in nouveaux or []:
+        if not isinstance(m, dict):
+            continue
+        cle = _cle_snapshot_tennis(m)
+        vus.add(cle)
+        old = index_old.get(cle)
+        a_commence = bool(m.get("a_commence")) or _match_a_commence_tennis(m)
+        if old and old.get("fige"):
+            frozen = dict(old)
+            frozen["statut"] = m.get("statut") or frozen.get("statut")
+            frozen["state"] = m.get("state") or frozen.get("state")
+            merges.append(frozen)
+        elif old and a_commence:
+            frozen = dict(old)
+            frozen["fige"] = True
+            frozen["fige_le"] = old.get("fige_le") or maintenant_iso
+            frozen["statut"] = m.get("statut") or old.get("statut")
+            frozen["state"] = m.get("state") or old.get("state")
+            merges.append(frozen)
+        else:
+            new_m = dict(m)
+            if a_commence:
+                new_m["fige"] = True
+                new_m["fige_le"] = maintenant_iso
+            else:
+                new_m["fige"] = False
+            merges.append(new_m)
+    for cle, old in index_old.items():
+        if cle not in vus and old.get("fige"):
+            merges.append(old)
+    return merges
+
+
+def _sauvegarder_predictions_tennis(date_str: str, matches_snapshot: list) -> None:
+    """Archive locale des Hot Pronostics (figés au coup d'envoi). Ne lève jamais."""
+    try:
+        historique = _charger_historique_predictions_tennis()
+        maintenant_iso = datetime.now(TZ_PARIS).isoformat()
+        existants = (historique.get(date_str) or {}).get("matches") or []
+        merges = _fusionner_snapshots_figes_tennis(existants, matches_snapshot, maintenant_iso)
+        historique[date_str] = {
+            "sauvegarde_le": maintenant_iso,
+            "matches": merges,
+        }
+        date_limite = (datetime.now(TZ_PARIS) - timedelta(days=30)).strftime("%Y-%m-%d")
+        historique = {d: v for d, v in historique.items() if d >= date_limite}
+        with open(CHEMIN_HISTORIQUE, "w", encoding="utf-8") as f:
+            json.dump(historique, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _archives_tennis_journee(date_ref: str) -> dict:
+    """Index match_id → snapshot pour aujourd'hui + hier (session US)."""
+    historique = _charger_historique_predictions_tennis()
+    index = {}
+    try:
+        hier = (datetime.strptime(date_ref, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+    except ValueError:
+        hier = (datetime.now(TZ_PARIS) - timedelta(days=1)).strftime("%Y-%m-%d")
+    for d in (hier, date_ref):
+        index.update(_index_snapshots_tennis((historique.get(d) or {}).get("matches") or []))
+    return index
 
 
 def appeler_avec_retry(fonction, *args, tentatives: int = 3, delai_base: float = 0.5, **kwargs):
@@ -593,6 +719,7 @@ def construire_resume_tennis(cache_bust: int = 0):
 
     classements = obtenir_classements_tennis()
     index_cotes = obtenir_cotes_tennis_du_jour(_obtenir_cle_odds_api())
+    archives = _archives_tennis_journee(date_ref)
 
     lignes_jour = []
     lignes_termines = []
@@ -616,7 +743,17 @@ def construire_resume_tennis(cache_bust: int = 0):
 
         if not m.get("termine"):
             continue
-        pred = _calculer_prediction_match(m, classements, index_cotes)
+        # Validation sur la prédiction FIGÉE si disponible (même source que Hot Pronostics)
+        old = archives.get(_cle_snapshot_tennis(m))
+        if old and old.get("favori"):
+            pred = {
+                "favori": old.get("favori"),
+                "favori_pct": old.get("favori_pct"),
+                "sets_kind": old.get("sets_kind"),
+                "sets_pct": old.get("sets_pct"),
+            }
+        else:
+            pred = _calculer_prediction_match(m, classements, index_cotes)
         valid = _valider_predictions_terminees(m, pred)
         lignes_termines.append({
             "Heure": m.get("heure_paris") or "—",
@@ -635,58 +772,72 @@ def construire_resume_tennis(cache_bust: int = 0):
 
 def construire_donnees_hot_pronostics_tennis(cache_bust: int = 0):
     """
-    Tous les matchs du jour (simples de préférence, puis doubles),
+    TOUS les matchs de la journée (simples + doubles, tous championnats),
     avec 2 values : victoire + les 2 gagnent un set.
+    Dès qu'un match a commencé, sa prédiction est FIGÉE (dernière version pré-match).
     """
     matchs, date_ref = obtenir_matchs_tennis_du_jour(cache_bust)
     classements = obtenir_classements_tennis()
     api_key = _obtenir_cle_odds_api()
     index_cotes = obtenir_cotes_tennis_du_jour(api_key)
+    archives = _archives_tennis_journee(date_ref)
 
-    # Hot Pronostics : on priorise les simples ; on garde les doubles s'il n'y a
-    # aucun simple (journée atypique).
-    simples = [m for m in matchs if m.get("est_simple")]
-    cibles = simples if simples else matchs
-
+    cibles = list(matchs)  # tous les matchs, sans filtre simples
     lignes = []
+    snapshots = []
+    maintenant_iso = datetime.now(TZ_PARIS).isoformat()
+
     for m in cibles:
-        pred = _calculer_prediction_match(m, classements, index_cotes)
-        favori = pred["favori"]
-        favori_pct = pred["favori_pct"]
-        sets_kind = pred["sets_kind"]
-        sets_pct = pred["sets_pct"]
-        p1, p2 = pred["proba_j1"], pred["proba_j2"]
-        fav_rang, out_rang = pred["fav_rang"], pred["out_rang"]
-        cote1, cote2 = pred["cote1"], pred["cote2"]
-        sets_label = f"{sets_kind} ({sets_pct:.0f}%)"
+        cle = _cle_snapshot_tennis(m)
+        old = archives.get(cle)
+        a_commence = _match_a_commence_tennis(m)
+        utiliser_fige = bool(old and (old.get("fige") or a_commence) and old.get("favori"))
 
-        detail_victoire = []
-        if fav_rang:
-            detail_victoire.append(f"Rang favori #{fav_rang}")
-        if out_rang:
-            detail_victoire.append(f"adv. #{out_rang}")
-        if cote1 and cote2:
-            detail_victoire.append("cotes marché intégrées")
+        if utiliser_fige:
+            favori = old.get("favori")
+            favori_pct = old.get("favori_pct")
+            sets_kind = old.get("sets_kind") or "NON"
+            sets_pct = old.get("sets_pct")
+            p1 = old.get("proba_j1")
+            p2 = old.get("proba_j2")
+            detail_base = old.get("victoire_detail_base") or "prédiction figée"
+            detail_sets_base = old.get("sets_detail_base") or f"Best-of-{m.get('best_of') or 3}"
+            fige = True
         else:
-            detail_victoire.append("classement uniquement")
+            pred = _calculer_prediction_match(m, classements, index_cotes)
+            favori = pred["favori"]
+            favori_pct = pred["favori_pct"]
+            sets_kind = pred["sets_kind"]
+            sets_pct = pred["sets_pct"]
+            p1, p2 = pred["proba_j1"], pred["proba_j2"]
+            parts = []
+            if pred.get("fav_rang"):
+                parts.append(f"Rang favori #{pred['fav_rang']}")
+            if pred.get("out_rang"):
+                parts.append(f"adv. #{pred['out_rang']}")
+            parts.append(
+                "cotes marché intégrées" if (pred.get("cote1") and pred.get("cote2"))
+                else "classement uniquement"
+            )
+            detail_base = " · ".join(parts)
+            detail_sets_base = (
+                f"Best-of-{m.get('best_of') or 3} · "
+                f"{'match équilibré attendu' if sets_kind == 'OUI' else 'écart important → straight sets probable'}"
+            )
+            fige = bool(a_commence)
 
-        detail_sets = (
-            f"Best-of-{m.get('best_of') or 3} · "
-            f"{'match équilibré attendu' if sets_kind == 'OUI' else 'écart important → straight sets probable'}"
-        )
-
-        # Hot Pronostics = toujours la PRÉDICTION. Si le match est terminé, on
-        # ajoute le résultat réel en détail (sans écraser favori / %).
-        statut = m.get("statut") or "—"
-        detail_victoire_txt = " · ".join(detail_victoire)
-        detail_sets_txt = detail_sets
-        sets_kind_aff, sets_label_aff, sets_pct_aff = sets_kind, sets_label, sets_pct
+        sets_label = f"{sets_kind} ({float(sets_pct):.0f}%)" if sets_pct is not None else str(sets_kind)
+        detail_victoire_txt = detail_base
+        detail_sets_txt = detail_sets_base
+        if fige:
+            detail_victoire_txt = f"🔒 figé · {detail_victoire_txt}"
+            detail_sets_txt = f"🔒 figé · {detail_sets_txt}"
 
         if m.get("termine"):
             vainqueur_reel = m["joueur1"] if m.get("joueur1_winner") else (
                 m["joueur2"] if m.get("joueur2_winner") else "—"
             )
-            ok_victoire = (vainqueur_reel == favori)
+            ok_victoire = _normaliser_nom(vainqueur_reel) == _normaliser_nom(favori or "")
             detail_victoire_txt = (
                 f"Résultat : {vainqueur_reel} "
                 f"({'✅' if ok_victoire else '❌'} vs prédit {favori}) · "
@@ -694,30 +845,70 @@ def construire_donnees_hot_pronostics_tennis(cache_bust: int = 0):
             )
             both_sets_reel = m.get("joueur1_sets", 0) > 0 and m.get("joueur2_sets", 0) > 0
             if m.get("joueur1_sets", 0) + m.get("joueur2_sets", 0) > 0:
-                ok_sets = (sets_kind == "OUI") == both_sets_reel
+                ok_sets = ((sets_kind or "").upper() == "OUI") == both_sets_reel
                 detail_sets_txt = (
                     f"Résultat : {'OUI' if both_sets_reel else 'NON'} "
-                    f"({'✅' if ok_sets else '❌'}) · {detail_sets}"
+                    f"({'✅' if ok_sets else '❌'}) · {detail_sets_txt}"
                 )
 
+        statut = m.get("statut") or "—"
         lignes.append({
             "confrontation": f"{m['joueur1']} vs {m['joueur2']}",
             "heure": m.get("heure_paris") or "—",
             "tournoi": m.get("tournoi"),
             "tableau": m.get("tableau"),
-            "statut": statut,
+            "statut": ("🔒 " if fige else "") + statut,
+            "fige": fige,
             "favori": favori,
             "favori_pct": favori_pct,
             "victoire_detail": detail_victoire_txt,
-            "sets_kind": sets_kind_aff,
-            "sets_label": sets_label_aff,
-            "sets_pct": sets_pct_aff,
+            "sets_kind": sets_kind,
+            "sets_label": sets_label,
+            "sets_pct": sets_pct,
             "sets_detail": detail_sets_txt,
             "proba_j1": p1,
             "proba_j2": p2,
             "joueur1": m["joueur1"],
             "joueur2": m["joueur2"],
+            "match_id": m.get("match_id"),
         })
+
+        # Snapshot à archiver : si déjà figé on renvoie l'ancien (fusion le conservera)
+        if utiliser_fige and old:
+            snap = dict(old)
+            snap["statut"] = statut
+            snap["state"] = m.get("state")
+            snap["a_commence"] = a_commence
+            snapshots.append(snap)
+        else:
+            snapshots.append({
+                "match_id": m.get("match_id"),
+                "joueur1": m["joueur1"],
+                "joueur2": m["joueur2"],
+                "date_paris": m.get("date_paris") or date_ref,
+                "statut": statut,
+                "state": m.get("state"),
+                "a_commence": a_commence,
+                "favori": favori,
+                "favori_pct": favori_pct,
+                "sets_kind": sets_kind,
+                "sets_pct": sets_pct,
+                "proba_j1": p1,
+                "proba_j2": p2,
+                "victoire_detail_base": detail_base,
+                "sets_detail_base": detail_sets_base,
+                "fige": fige,
+                "fige_le": maintenant_iso if fige else None,
+            })
+
+    # Sauvegarde par date Paris de chaque match (+ date_ref pour la journée)
+    par_date: dict[str, list] = {}
+    for snap in snapshots:
+        d = snap.get("date_paris") or date_ref
+        par_date.setdefault(d, []).append(snap)
+    par_date.setdefault(date_ref, snapshots)
+    for d, snaps in par_date.items():
+        _sauvegarder_predictions_tennis(d, snaps)
 
     return cibles, lignes, date_ref
 
@@ -862,10 +1053,15 @@ with onglets[1]:
                 "(ajusté best-of-3 / best-of-5)."
             )
             st.caption(
-                "⚠️ Heuristiques automatiques à titre informatif — pas de garantie de résultat."
+                "🔒 Dès qu'un match a commencé, sa carte est figée (dernière prédiction pré-match). "
+                "Tous les matchs du jour sont affichés (simples et doubles)."
             )
             st.caption(
-                f"📅 {len(matchs_jour)} match(s) · date {date_ref} (Paris) · "
+                "⚠️ Heuristiques automatiques à titre informatif — pas de garantie de résultat."
+            )
+            n_figes = sum(1 for r in lignes_recap if r.get("fige"))
+            st.caption(
+                f"📅 {len(matchs_jour)} match(s) · {n_figes} figé(s) · date {date_ref} (Paris) · "
                 f"{len({m.get('tournoi') for m in matchs_jour})} tournoi(x)"
             )
 
@@ -879,8 +1075,9 @@ with onglets[1]:
                       (et les cotes h2h The-Odds-API si la clé est dans les secrets).
                     - **Les 2 gagnent un set** : fonction de l'équilibre du match
                       (`≈ 74%` à 50/50, diminue quand l'écart de favori grandit).
-                    - Les matchs **terminés** affichent le résultat réel, avec la
-                      prédiction rappelée en détail.
+                    - Les matchs **commencés** figent la prédiction (🔒) ; les matchs
+                      terminés affichent aussi le résultat réel en détail.
+                    - **Tous** les matchs du jour sont listés (simples et doubles).
                     """
                 )
 

@@ -866,13 +866,16 @@ def afficher_tableau_recap_hot_pronostics_tennis(rows: list) -> None:
         with st.container(border=True):
             c1, c2, c3 = st.columns(widths)
             with c1:
-                st.markdown(f"**{row.get('confrontation') or '—'}**")
+                titre = row.get("confrontation") or "—"
+                if row.get("fige"):
+                    titre = f"{titre} 🔒"
+                st.markdown(f"**{titre}**")
                 meta = " · ".join(
                     x for x in (
                         row.get("heure"),
-                        row.get("tournoi"),
                         row.get("tableau"),
                         row.get("statut"),
+                        "figé" if row.get("fige") else "",
                     ) if x
                 )
                 if meta:

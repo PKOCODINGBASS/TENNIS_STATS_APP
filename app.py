@@ -491,13 +491,110 @@ def _infos_joueur(nom: str, classements: dict) -> dict:
 # ============================================================
 # Construction des vues
 # ============================================================
-def construire_resume_tennis(cache_bust: int = 0) -> tuple[pd.DataFrame, str | None, str]:
+def _calculer_prediction_match(m: dict, classements: dict, index_cotes: dict) -> dict:
+    """Calcule favori / sets pour un match (réutilisé Résumé + Hot Pronostics)."""
+    i1 = _infos_joueur(m["joueur1"], classements)
+    i2 = _infos_joueur(m["joueur2"], classements)
+    cotes = _cotes_pour_match(m, index_cotes) or {}
+    cote1 = cotes.get(_normaliser_nom(m["joueur1"]))
+    cote2 = cotes.get(_normaliser_nom(m["joueur2"]))
+
+    p1, p2 = predire_probabilite_victoire_tennis(
+        i1.get("rang"), i2.get("rang"),
+        i1.get("points") or 0.0, i2.get("points") or 0.0,
+        cote1, cote2,
+    )
+    if p1 >= p2:
+        favori, favori_pct = m["joueur1"], p1
+        fav_rang, out_rang = i1.get("rang"), i2.get("rang")
+    else:
+        favori, favori_pct = m["joueur2"], p2
+        fav_rang, out_rang = i2.get("rang"), i1.get("rang")
+
+    sets_kind, sets_pct = predire_les_deux_gagnent_un_set(favori_pct, m.get("best_of") or 3)
+    return {
+        "proba_j1": p1,
+        "proba_j2": p2,
+        "favori": favori,
+        "favori_pct": favori_pct,
+        "sets_kind": sets_kind,
+        "sets_pct": sets_pct,
+        "fav_rang": fav_rang,
+        "out_rang": out_rang,
+        "cote1": cote1,
+        "cote2": cote2,
+    }
+
+
+def _valider_predictions_terminees(m: dict, pred: dict) -> dict:
+    """
+    Pour un match terminé : icônes ✅/❌ + notes sur vainqueur prédit et
+    « les 2 gagnent un set ».
+    """
+    if m.get("joueur1_winner"):
+        vainqueur = m["joueur1"]
+    elif m.get("joueur2_winner"):
+        vainqueur = m["joueur2"]
+    else:
+        vainqueur = None
+
+    favori = pred.get("favori")
+    if not vainqueur or not favori:
+        return {
+            "victoire_icone": "⏳",
+            "victoire_note": "Résultat indisponible",
+            "sets_icone": "⏳",
+            "sets_note": "Résultat indisponible",
+        }
+
+    ok_victoire = _normaliser_nom(vainqueur) == _normaliser_nom(favori)
+    victoire_icone = "✅" if ok_victoire else "❌"
+    victoire_note = (
+        f"{victoire_icone} Prédit {favori} ({pred.get('favori_pct'):.0f}%)"
+        + ("" if ok_victoire else f" → réel : {vainqueur}")
+    )
+
+    both_sets_reel = (m.get("joueur1_sets") or 0) > 0 and (m.get("joueur2_sets") or 0) > 0
+    sets_kind = (pred.get("sets_kind") or "").upper()
+    if (m.get("joueur1_sets") or 0) + (m.get("joueur2_sets") or 0) <= 0:
+        sets_icone, sets_note = "⏳", "Sets non disponibles"
+    else:
+        ok_sets = (sets_kind == "OUI") == both_sets_reel
+        sets_icone = "✅" if ok_sets else "❌"
+        reel_txt = "OUI" if both_sets_reel else "NON"
+        sets_note = (
+            f"{sets_icone} Prédit {sets_kind} ({pred.get('sets_pct'):.0f}%)"
+            + ("" if ok_sets else f" → réel : {reel_txt}")
+        )
+
+    return {
+        "victoire_icone": victoire_icone,
+        "victoire_note": victoire_note,
+        "sets_icone": sets_icone,
+        "sets_note": sets_note,
+    }
+
+
+def construire_resume_tennis(cache_bust: int = 0):
+    """
+    Retourne (df_jour, df_termines, erreur, date_ref).
+    - df_jour : tous les matchs (colonnes simplifiées)
+    - df_termines : confrontations terminées + validation prédictions
+    """
     try:
         matchs, date_ref = obtenir_matchs_tennis_du_jour(cache_bust)
     except Exception as exc:
-        return pd.DataFrame(), f"Impossible de charger les matchs ({exc}).", datetime.now(TZ_PARIS).strftime("%Y-%m-%d")
+        return (
+            pd.DataFrame(), pd.DataFrame(),
+            f"Impossible de charger les matchs ({exc}).",
+            datetime.now(TZ_PARIS).strftime("%Y-%m-%d"),
+        )
 
-    lignes = []
+    classements = obtenir_classements_tennis()
+    index_cotes = obtenir_cotes_tennis_du_jour(_obtenir_cle_odds_api())
+
+    lignes_jour = []
+    lignes_termines = []
     for m in matchs:
         if m.get("joueur1_winner"):
             vainqueur = m["joueur1"]
@@ -506,18 +603,35 @@ def construire_resume_tennis(cache_bust: int = 0) -> tuple[pd.DataFrame, str | N
         else:
             vainqueur = "—"
         sets = f"{m['joueur1_sets']}-{m['joueur2_sets']}" if m.get("state") != "pre" else "—"
-        lignes.append({
+        confrontation = f"{m['joueur1']} vs {m['joueur2']}"
+        lignes_jour.append({
             "Heure": m.get("heure_paris") or "—",
             "Tournoi": m.get("tournoi") or "—",
-            "Tableau": m.get("tableau") or "—",
-            "Match": f"{m['joueur1']} vs {m['joueur2']}",
+            "Match": confrontation,
             "Statut": m.get("statut") or "—",
             "Score": m.get("score") or "—",
             "Sets": sets,
             "Vainqueur": vainqueur,
-            "Court": m.get("court") or "—",
         })
-    return pd.DataFrame(lignes), None, date_ref
+
+        if not m.get("termine"):
+            continue
+        pred = _calculer_prediction_match(m, classements, index_cotes)
+        valid = _valider_predictions_terminees(m, pred)
+        lignes_termines.append({
+            "Heure": m.get("heure_paris") or "—",
+            "Tournoi": m.get("tournoi") or "—",
+            "Match": confrontation,
+            "Score": m.get("score") or "—",
+            "Sets": sets,
+            "Vainqueur": vainqueur,
+            "Pred. victoire": valid["victoire_note"],
+            "Pred. sets": valid["sets_note"],
+            "_ok_victoire": valid["victoire_icone"] == "✅",
+            "_ok_sets": valid["sets_icone"] == "✅",
+        })
+
+    return pd.DataFrame(lignes_jour), pd.DataFrame(lignes_termines), None, date_ref
 
 
 def construire_donnees_hot_pronostics_tennis(cache_bust: int = 0):
@@ -537,25 +651,14 @@ def construire_donnees_hot_pronostics_tennis(cache_bust: int = 0):
 
     lignes = []
     for m in cibles:
-        i1 = _infos_joueur(m["joueur1"], classements)
-        i2 = _infos_joueur(m["joueur2"], classements)
-        cotes = _cotes_pour_match(m, index_cotes) or {}
-        cote1 = cotes.get(_normaliser_nom(m["joueur1"]))
-        cote2 = cotes.get(_normaliser_nom(m["joueur2"]))
-
-        p1, p2 = predire_probabilite_victoire_tennis(
-            i1.get("rang"), i2.get("rang"),
-            i1.get("points") or 0.0, i2.get("points") or 0.0,
-            cote1, cote2,
-        )
-        if p1 >= p2:
-            favori, favori_pct, outsider = m["joueur1"], p1, m["joueur2"]
-            fav_rang, out_rang = i1.get("rang"), i2.get("rang")
-        else:
-            favori, favori_pct, outsider = m["joueur2"], p2, m["joueur1"]
-            fav_rang, out_rang = i2.get("rang"), i1.get("rang")
-
-        sets_kind, sets_pct = predire_les_deux_gagnent_un_set(favori_pct, m.get("best_of") or 3)
+        pred = _calculer_prediction_match(m, classements, index_cotes)
+        favori = pred["favori"]
+        favori_pct = pred["favori_pct"]
+        sets_kind = pred["sets_kind"]
+        sets_pct = pred["sets_pct"]
+        p1, p2 = pred["proba_j1"], pred["proba_j2"]
+        fav_rang, out_rang = pred["fav_rang"], pred["out_rang"]
+        cote1, cote2 = pred["cote1"], pred["cote2"]
         sets_label = f"{sets_kind} ({sets_pct:.0f}%)"
 
         detail_victoire = []
@@ -671,7 +774,9 @@ with onglets[0]:
                 pass
 
         with st.spinner("Récupération des scores tennis (ESPN)..."):
-            df_resume, err, date_ref = construire_resume_tennis(st.session_state.tennis_resume_bust)
+            df_resume, df_termines, err, date_ref = construire_resume_tennis(
+                st.session_state.tennis_resume_bust
+            )
 
         st.caption(f"Date de référence (heure de Paris) : {date_ref}")
         if err:
@@ -692,15 +797,47 @@ with onglets[0]:
                 column_config={
                     "Heure": st.column_config.TextColumn("Heure", width="small"),
                     "Tournoi": st.column_config.TextColumn("Tournoi", width="medium"),
-                    "Tableau": st.column_config.TextColumn("Tableau", width="small"),
                     "Match": st.column_config.TextColumn("Match", width="large"),
                     "Statut": st.column_config.TextColumn("Statut", width="small"),
                     "Score": st.column_config.TextColumn("Score", width="medium"),
                     "Sets": st.column_config.TextColumn("Sets", width="small"),
                     "Vainqueur": st.column_config.TextColumn("Vainqueur", width="medium"),
-                    "Court": st.column_config.TextColumn("Court", width="small"),
                 },
             )
+
+            st.markdown("---")
+            st.subheader("✅ Confrontations terminées — validation des prédictions")
+            st.caption(
+                "Pour chaque match fini : ✅ si la prédiction est bonne, ❌ sinon — "
+                "sur le vainqueur et sur « les 2 gagnent un set »."
+            )
+            if df_termines.empty:
+                st.info("Aucune confrontation terminée à valider pour le moment.")
+            else:
+                n_ok_v = int(df_termines["_ok_victoire"].sum()) if "_ok_victoire" in df_termines else 0
+                n_ok_s = int(df_termines["_ok_sets"].sum()) if "_ok_sets" in df_termines else 0
+                n_tot = len(df_termines)
+                st.caption(
+                    f"{n_tot} match(s) terminé(s) · "
+                    f"victoires validées {n_ok_v}/{n_tot} · "
+                    f"sets validés {n_ok_s}/{n_tot}"
+                )
+                df_aff = df_termines.drop(columns=["_ok_victoire", "_ok_sets"], errors="ignore")
+                st.dataframe(
+                    df_aff,
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "Heure": st.column_config.TextColumn("Heure", width="small"),
+                        "Tournoi": st.column_config.TextColumn("Tournoi", width="medium"),
+                        "Match": st.column_config.TextColumn("Match", width="large"),
+                        "Score": st.column_config.TextColumn("Score", width="medium"),
+                        "Sets": st.column_config.TextColumn("Sets", width="small"),
+                        "Vainqueur": st.column_config.TextColumn("Vainqueur", width="medium"),
+                        "Pred. victoire": st.column_config.TextColumn("Pred. victoire", width="large"),
+                        "Pred. sets": st.column_config.TextColumn("Pred. sets", width="large"),
+                    },
+                )
 
 # ---- Hot Pronostics ----
 with onglets[1]:

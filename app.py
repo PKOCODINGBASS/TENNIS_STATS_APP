@@ -607,7 +607,6 @@ def construire_resume_tennis(cache_bust: int = 0):
         confrontation = f"{m['joueur1']} vs {m['joueur2']}"
         lignes_jour.append({
             "Heure": m.get("heure_paris") or "—",
-            "Tournoi": m.get("tournoi") or "—",
             "Match": confrontation,
             "Statut": m.get("statut") or "—",
             "Score": m.get("score") or "—",
@@ -621,7 +620,6 @@ def construire_resume_tennis(cache_bust: int = 0):
         valid = _valider_predictions_terminees(m, pred)
         lignes_termines.append({
             "Heure": m.get("heure_paris") or "—",
-            "Tournoi": m.get("tournoi") or "—",
             "Match": confrontation,
             "Score": m.get("score") or "—",
             "Sets": sets,
@@ -797,7 +795,6 @@ with onglets[0]:
                 width="stretch",
                 column_config={
                     "Heure": st.column_config.TextColumn("Heure", width="small"),
-                    "Tournoi": st.column_config.TextColumn("Tournoi", width="medium"),
                     "Match": st.column_config.TextColumn("Match", width="large"),
                     "Statut": st.column_config.TextColumn("Statut", width="small"),
                     "Score": st.column_config.TextColumn("Score", width="medium"),
@@ -830,7 +827,6 @@ with onglets[0]:
                     width="stretch",
                     column_config={
                         "Heure": st.column_config.TextColumn("Heure", width="small"),
-                        "Tournoi": st.column_config.TextColumn("Tournoi", width="medium"),
                         "Match": st.column_config.TextColumn("Match", width="large"),
                         "Score": st.column_config.TextColumn("Score", width="medium"),
                         "Sets": st.column_config.TextColumn("Sets", width="small"),

@@ -281,13 +281,16 @@ def _extraire_matchs_depuis_scoreboard(data: dict, ligue_slug: str) -> list[dict
 
 
 @st.cache_data(show_spinner=False, ttl=180)
-def obtenir_matchs_tennis_du_jour(cache_bust: int = 0, _cache_version: int = 2) -> tuple[list[dict], str]:
+def obtenir_matchs_tennis_du_jour(cache_bust: int = 0, _cache_version: int = 3) -> tuple[list[dict], str]:
     """
-    Agrège tous les matchs du jour (heure de Paris), tous championnats ESPN
-    disponibles. `cache_bust` force le rafraîchissement depuis l'UI.
+    Agrège les matchs de la journée tennis (heure de Paris), tous championnats ESPN.
+    Inclut : date Paris = aujourd'hui, plus les matchs encore en cours / à venir
+    démarrés la veille (sessions Nord-Amérique qui débordent après minuit Paris).
     """
     del cache_bust, _cache_version
-    aujourdhui = datetime.now(TZ_PARIS).strftime("%Y-%m-%d")
+    maintenant = datetime.now(TZ_PARIS)
+    aujourdhui = maintenant.strftime("%Y-%m-%d")
+    hier = (maintenant - timedelta(days=1)).strftime("%Y-%m-%d")
     vus = set()
     matchs = []
     for ligue in LIGUES_ESPN:
@@ -296,7 +299,16 @@ def obtenir_matchs_tennis_du_jour(cache_bust: int = 0, _cache_version: int = 2) 
         except Exception:
             continue
         for m in _extraire_matchs_depuis_scoreboard(data, ligue):
-            if m.get("date_paris") != aujourdhui:
+            date_m = m.get("date_paris") or ""
+            state = m.get("state") or ""
+            if date_m == aujourdhui:
+                garder = True
+            elif date_m == hier and state in ("in", "pre"):
+                # Session US encore live / pas jouée après minuit Paris
+                garder = True
+            else:
+                garder = False
+            if not garder:
                 continue
             cle = (m["match_id"], m["joueur1"], m["joueur2"])
             if cle in vus:

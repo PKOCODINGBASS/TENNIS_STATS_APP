@@ -847,16 +847,22 @@ def repondre_question_hot_pronostics(
 
 def afficher_tableau_recap_hot_pronostics_tennis(rows: list) -> None:
     """
-    Tableau Hot Pronostics tennis — 2 values uniquement :
-      1) Victoire (favori + %)
+    Tableau Hot Pronostics tennis :
+      1) Victoire (favori + %) + Value Bet
       2) Les deux gagnent un set (Oui / Non + %)
     """
     if not rows:
         st.info("Aucun match à afficher dans le tableau de bord du jour.")
         return
 
-    widths = [1.3, 1.1, 1.1]
-    headers = ["Confrontation", "Victoire", "Les 2 gagnent un set"]
+    value_emoji = {
+        "value": "🟢",
+        "medium": "🟠",
+        "avoid": "🔴",
+        "none": "⚪",
+    }
+    widths = [1.3, 1.2, 1.0]
+    headers = ["Confrontation", "Victoire & Value", "Les 2 gagnent un set"]
     header_cols = st.columns(widths)
     for col, title in zip(header_cols, headers):
         with col:
@@ -891,7 +897,11 @@ def afficher_tableau_recap_hot_pronostics_tennis(rows: list) -> None:
                 else:
                     txt = "Non disponible"
                 st.markdown(f"**🎾 {txt}**")
-                if row.get("victoire_detail"):
+                emoji = value_emoji.get(row.get("value_kind") or "none", "⚪")
+                st.caption(f"{emoji} {row.get('value_label') or 'Pas de value'}")
+                if row.get("value_msg"):
+                    st.caption(str(row["value_msg"]))
+                elif row.get("victoire_detail"):
                     st.caption(str(row["victoire_detail"]))
             with c3:
                 kind = (row.get("sets_kind") or "").upper()
@@ -907,18 +917,18 @@ def afficher_assistant_hot_pronostics_tennis(
     *,
     key_prefix: str = "tennis_hot",
 ) -> None:
-    """Boîte de questions tennis (victoire / les 2 gagnent un set)."""
+    """Boîte de questions tennis (victoire / value / les 2 gagnent un set)."""
     st.subheader("💬 Pose une question")
     st.caption(
-        "Exemples : « Qui est le plus gros favori du jour ? », "
-        "« Dans quels matchs les deux devraient gagner un set ? », "
-        "« Donne-moi les 3 meilleurs favoris »."
+        "Exemples : « Où est la value ? », "
+        "« Qui est le plus gros favori du jour ? », "
+        "« Dans quels matchs les deux devraient gagner un set ? »."
     )
 
     input_key = f"{key_prefix}_input_question"
     exemples = [
+        "Où est la value du jour ?",
         "Qui est le plus gros favori du jour ?",
-        "Donne-moi les 3 meilleurs favoris",
         "Dans quels matchs les deux devraient gagner un set ?",
         "Quels matchs sont plutôt en straight sets ?",
     ]
@@ -950,13 +960,17 @@ def repondre_question_hot_pronostics_tennis(question: str, lignes_recap: list) -
     """Réponse lecture seule à partir du tableau tennis du jour."""
     q_raw = (question or "").strip()
     if not q_raw:
-        return "Écris une question sur les favoris ou les sets du jour."
+        return "Écris une question sur les favoris, la value ou les sets du jour."
     if not lignes_recap:
         return "Aucun match chargé pour répondre."
 
     q = _normaliser_texte_question(q_raw)
     n = _extraire_n_question_hot(q_raw, defaut=3)
 
+    veut_value = any(k in q for k in (
+        "value", "value bet", "cote juste", "sous-evalue", "sous evalue",
+        "ou est la value", "meilleure value", "pas de value",
+    ))
     veut_sets_oui = any(k in q for k in (
         "gagnent un set", "gagnent un sete", "both set", "deux sets", "2 sets",
         "les deux", "set chacun", "au moins un set",
@@ -964,12 +978,35 @@ def repondre_question_hot_pronostics_tennis(question: str, lignes_recap: list) -
     veut_straight = any(k in q for k in (
         "straight", "2-0", "deux sets a zero", "sans perdre de set", "sec",
     ))
-    veut_favori = any(k in q for k in (
-        "favori", "favoris", "victoire", "gagner", "qui gagne", "proba",
-    )) or (not veut_sets_oui and not veut_straight)
+    veut_favori = (not veut_value) and (
+        any(k in q for k in (
+            "favori", "favoris", "victoire", "gagner", "qui gagne", "proba",
+        )) or (not veut_sets_oui and not veut_straight)
+    )
 
     lignes = list(lignes_recap)
     parties = []
+
+    if veut_value:
+        ordre = {"value": 0, "medium": 1, "avoid": 2, "none": 3}
+        tries = sorted(
+            lignes,
+            key=lambda r: (ordre.get(r.get("value_kind") or "none", 9), -(float(r.get("favori_pct") or 0))),
+        )
+        fortes = [r for r in tries if r.get("value_kind") == "value"]
+        moyennes = [r for r in tries if r.get("value_kind") == "medium"]
+        top = (fortes + moyennes)[:n] if (fortes or moyennes) else tries[:n]
+        if not top:
+            parties.append("Aucune value détectée (cotes marché souvent absentes).")
+        else:
+            out = [f"**Top {len(top)} values** du jour :"]
+            for i, row in enumerate(top, 1):
+                emoji = {"value": "🟢", "medium": "🟠", "avoid": "🔴"}.get(row.get("value_kind"), "⚪")
+                msg = row.get("value_msg") or row.get("value_label") or "Pas de value"
+                out.append(
+                    f"{i}. {emoji} **{row.get('favori')}** — {row.get('confrontation')} · {msg}"
+                )
+            parties.append("\n".join(out))
 
     if veut_favori and not veut_sets_oui and not veut_straight:
         tries = []
@@ -992,7 +1029,7 @@ def repondre_question_hot_pronostics_tennis(question: str, lignes_recap: list) -
                 )
             parties.append("\n".join(out))
 
-    if veut_sets_oui or (not veut_favori and not veut_straight and "set" in q):
+    if veut_sets_oui or (not veut_favori and not veut_value and not veut_straight and "set" in q):
         oui = [r for r in lignes if (r.get("sets_kind") or "").upper() == "OUI"]
         oui.sort(key=lambda r: float(r.get("sets_pct") or 0), reverse=True)
         top = oui[:n]

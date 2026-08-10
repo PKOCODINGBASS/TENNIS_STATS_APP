@@ -3,7 +3,7 @@ Application d'Analyse Statistiques Tennis (ATP / WTA via ESPN)
 ===================================================================
 Même esprit que MLB / NPB / KBO / NHL, avec 2 onglets uniquement :
   - Résumé du jour (tous matchs, tous championnats)
-  - Hot Pronostics (victoire + les 2 gagnent un set) + assistant questions
+  - Hot Pronostics (matchs à venir Winamax ; retirés dès qu'ils quittent le board)
 
 Sources :
   - Scoreboard ESPN (`site.web.api.espn.com`) — calendrier / scores live
@@ -104,11 +104,28 @@ def _match_a_commence_tennis(match_ou_statut) -> bool:
     return False
 
 
+def _match_annule_ou_reporte_tennis(m: dict) -> bool:
+    statut = (m.get("statut") or "").strip().lower()
+    return any(x in statut for x in (
+        "cancel", "postpon", "abandoned", "walkover", "retired before",
+    ))
+
+
+def _match_est_a_venir_tennis(m: dict) -> bool:
+    """Hot Pronostics : uniquement les matchs pas encore commencés."""
+    if not m or m.get("termine") or _match_a_commence_tennis(m):
+        return False
+    if _match_annule_ou_reporte_tennis(m):
+        return False
+    return True
+
+
 def _cle_snapshot_tennis(m: dict) -> str:
-    mid = m.get("match_id")
-    if mid:
-        return f"id:{mid}"
-    return f"p:{_normaliser_nom(m.get('joueur1') or '')}|{_normaliser_nom(m.get('joueur2') or '')}|{m.get('date_paris') or ''}"
+    """Clé stable joueurs + date (indépendante ESPN / Winamax)."""
+    j1 = _normaliser_nom(m.get("joueur1") or "")
+    j2 = _normaliser_nom(m.get("joueur2") or "")
+    paire = "|".join(sorted([j1, j2]))
+    return f"p:{paire}|{m.get('date_paris') or ''}"
 
 
 def _charger_historique_predictions_tennis() -> dict:
@@ -246,8 +263,9 @@ def _obtenir_cle_odds_api() -> str | None:
 # Données ESPN — scoreboard & classements
 # ============================================================
 @st.cache_data(show_spinner=False, ttl=180)
-def _charger_scoreboard_espn(ligue: str) -> dict:
-    return appeler_avec_retry(_get_json, f"{ESPN_API}/{ligue}/scoreboard")
+def _charger_scoreboard_espn(ligue: str, dates: str | None = None) -> dict:
+    params = {"dates": dates} if dates else None
+    return appeler_avec_retry(_get_json, f"{ESPN_API}/{ligue}/scoreboard", params=params)
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
@@ -456,6 +474,56 @@ def obtenir_matchs_tennis_du_jour(cache_bust: int = 0, _cache_version: int = 5) 
     return matchs, aujourdhui
 
 
+@st.cache_data(show_spinner=False, ttl=180)
+def obtenir_matchs_tennis_fenetre(
+    cache_bust: int = 0,
+    jours_ahead: int = 7,
+    _cache_version: int = 2,
+) -> tuple[list[dict], str]:
+    """
+    Matchs ESPN sur la fenêtre aujourd'hui (Paris) → +jours_ahead
+    (tous états : pre / live / post), tous championnats.
+    """
+    del cache_bust, _cache_version
+    maintenant = datetime.now(TZ_PARIS)
+    aujourdhui = maintenant.strftime("%Y-%m-%d")
+    fin = (maintenant + timedelta(days=max(0, int(jours_ahead)))).strftime("%Y-%m-%d")
+    d0 = maintenant.strftime("%Y%m%d")
+    d1 = (maintenant + timedelta(days=max(0, int(jours_ahead)))).strftime("%Y%m%d")
+    vus = set()
+    matchs = []
+    for ligue in LIGUES_ESPN:
+        for dates_param in (None, f"{d0}-{d1}"):
+            try:
+                data = _charger_scoreboard_espn(ligue, dates_param)
+            except Exception:
+                continue
+            for m in _extraire_matchs_depuis_scoreboard(data, ligue):
+                date_paris = m.get("date_paris") or ""
+                if date_paris and (date_paris < aujourdhui or date_paris > fin):
+                    continue
+                cle = (m["match_id"], m["joueur1"], m["joueur2"])
+                if cle in vus:
+                    continue
+                vus.add(cle)
+                matchs.append(m)
+
+    matchs.sort(key=lambda m: (
+        m.get("date_paris") or "9999-99-99",
+        m.get("heure_paris") or "99:99",
+        m.get("tournoi") or "",
+        m.get("joueur1") or "",
+    ))
+    return matchs, aujourdhui
+
+
+def obtenir_matchs_tennis_a_venir(cache_bust: int = 0) -> tuple[list[dict], str]:
+    """Tous les matchs encore à venir dans la fenêtre Hot Pronostics."""
+    matchs, date_ref = obtenir_matchs_tennis_fenetre(cache_bust)
+    a_venir = [m for m in matchs if _match_est_a_venir_tennis(m)]
+    return a_venir, date_ref
+
+
 @st.cache_data(show_spinner=False, ttl=1800)
 def obtenir_classements_tennis() -> dict:
     """Fusion ATP + WTA indexée par nom normalisé."""
@@ -466,67 +534,196 @@ def obtenir_classements_tennis() -> dict:
 
 
 # ============================================================
-# Cotes (optionnel)
+# Cotes / matchs Winamax (The-Odds-API)
 # ============================================================
+# Même clé bookmaker que MLB / NPB / KBO.
+BOOKMAKERS_WINAMAX = ("winamax_fr", "winamax")
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+
+
+def _choisir_bookmaker_winamax(bookmakers: list) -> dict | None:
+    """Retourne le bookmaker Winamax s'il est présent, sinon None."""
+    if not bookmakers:
+        return None
+    by_key = {(b.get("key") or "").lower(): b for b in bookmakers}
+    for cle in BOOKMAKERS_WINAMAX:
+        if cle in by_key:
+            return by_key[cle]
+    return None
+
+
+def _extraire_cotes_h2h(bookmaker: dict) -> dict:
+    """{nom_joueur: cote_decimale} depuis un bookmaker Odds-API."""
+    cotes_raw = {}
+    for market in bookmaker.get("markets") or []:
+        if market.get("key") != "h2h":
+            continue
+        for outcome in market.get("outcomes") or []:
+            nom = outcome.get("name")
+            prix = _parser_float(outcome.get("price"))
+            if nom and prix and prix > 1:
+                cotes_raw[nom] = prix
+    return cotes_raw
+
+
 @st.cache_data(show_spinner=False, ttl=900)
-def obtenir_cotes_tennis_du_jour(api_key: str | None) -> dict:
-    """
-    Retourne {(nom1_norm, nom2_norm): {joueur: cote}} à partir des sports
-    tennis actifs The-Odds-API.
-    """
+def _lister_sports_tennis_odds_api(api_key: str) -> list[dict]:
+    """Sports tennis actifs côté The-Odds-API."""
     if not api_key:
-        return {}
+        return []
     try:
         sports = appeler_avec_retry(
             _get_json,
-            "https://api.the-odds-api.com/v4/sports",
+            f"{ODDS_API_BASE}/sports",
             {"apiKey": api_key},
         )
     except Exception:
-        return {}
-    tennis_keys = [
-        s["key"] for s in sports
+        return []
+    return [
+        s for s in (sports or [])
         if s.get("active") and (
             s.get("group") == "Tennis" or str(s.get("key", "")).startswith("tennis_")
         )
     ]
-    index = {}
-    for key in tennis_keys:
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def obtenir_matchs_tennis_winamax(
+    api_key: str | None,
+    cache_bust: int = 0,
+    _cache_version: int = 1,
+) -> tuple[list[dict], dict, str]:
+    """
+    Source Hot Pronostics : matchs à venir proposés par Winamax (The-Odds-API).
+
+    Retourne (matchs, index_cotes, date_ref_paris).
+    Un match n'apparaît que s'il a un marché h2h Winamax.
+    """
+    del cache_bust, _cache_version
+    date_ref = datetime.now(TZ_PARIS).strftime("%Y-%m-%d")
+    if not api_key:
+        return [], {}, date_ref
+
+    sports = _lister_sports_tennis_odds_api(api_key)
+    matchs = []
+    index_cotes = {}
+    vus = set()
+
+    for sport in sports:
+        sport_key = sport.get("key") or ""
+        tournoi = sport.get("title") or sport.get("description") or sport_key
         try:
             events = appeler_avec_retry(
                 _get_json,
-                f"https://api.the-odds-api.com/v4/sports/{key}/odds",
+                f"{ODDS_API_BASE}/sports/{sport_key}/odds",
                 {
                     "apiKey": api_key,
                     "regions": "eu",
                     "markets": "h2h",
                     "oddsFormat": "decimal",
+                    "bookmakers": ",".join(BOOKMAKERS_WINAMAX),
                 },
             )
         except Exception:
             continue
+
         for ev in events or []:
-            home = ev.get("home_team") or ""
-            away = ev.get("away_team") or ""
-            cotes = {}
-            for book in ev.get("bookmakers") or []:
-                for market in book.get("markets") or []:
-                    if market.get("key") != "h2h":
-                        continue
-                    for outcome in market.get("outcomes") or []:
-                        nom = outcome.get("name")
-                        prix = _parser_float(outcome.get("price"))
-                        if nom and prix and prix > 1:
-                            # moyenne simple si plusieurs bookmakers
-                            cotes.setdefault(nom, []).append(prix)
-            if not cotes:
+            home = (ev.get("home_team") or "").strip()
+            away = (ev.get("away_team") or "").strip()
+            if not home or not away:
                 continue
-            moyennes = {n: sum(v) / len(v) for n, v in cotes.items()}
+            choisi = _choisir_bookmaker_winamax(ev.get("bookmakers") or [])
+            if not choisi:
+                continue
+            cotes_raw = _extraire_cotes_h2h(choisi)
+            if len(cotes_raw) < 2:
+                continue
+
+            commence = ev.get("commence_time") or ""
+            heure_paris = ""
+            date_paris = ""
+            dt_paris = None
+            if commence:
+                try:
+                    dt_paris = datetime.fromisoformat(
+                        commence.replace("Z", "+00:00")
+                    ).astimezone(TZ_PARIS)
+                    heure_paris = dt_paris.strftime("%H:%M")
+                    date_paris = dt_paris.strftime("%Y-%m-%d")
+                except Exception:
+                    pass
+
+            match_id = str(ev.get("id") or f"wina-{sport_key}-{home}-{away}-{commence}")
+            cle_dup = (_normaliser_nom(home), _normaliser_nom(away), date_paris or commence)
+            if cle_dup in vus:
+                continue
+            vus.add(cle_dup)
+
+            book_title = choisi.get("title") or "Winamax"
             cle_ab = tuple(sorted([_normaliser_nom(home), _normaliser_nom(away)]))
-            index[cle_ab] = {_normaliser_nom(n): c for n, c in moyennes.items()}
-            # garder aussi les noms bruts pour affichage
-            index[cle_ab]["_raw"] = moyennes
-    return index
+            entry = {_normaliser_nom(n): c for n, c in cotes_raw.items()}
+            entry["_bookmaker"] = book_title
+            entry["_raw"] = cotes_raw
+            index_cotes[cle_ab] = entry
+
+            # Best-of : Grands Chelems hommes → 5, sinon 3
+            tournoi_l = (tournoi or "").lower()
+            est_gs = any(x in tournoi_l for x in (
+                "australian open", "roland garros", "french open", "wimbledon", "us open",
+            ))
+            est_double = "/" in home or "/" in away or "doubles" in tournoi_l
+            best_of = 5 if est_gs and not est_double and "wta" not in (sport_key or "") else 3
+
+            matchs.append({
+                "match_id": match_id,
+                "ligue": "ATP" if "atp" in sport_key else ("WTA" if "wta" in sport_key else "TENNIS"),
+                "tournoi": tournoi,
+                "tableau": "Doubles" if est_double else "Singles",
+                "slug_tableau": "doubles" if est_double else "singles",
+                "est_simple": not est_double,
+                "est_double": est_double,
+                "date_iso": commence,
+                "date_paris": date_paris,
+                "heure_paris": heure_paris,
+                "statut": "À venir (Winamax)",
+                "state": "pre",
+                "termine": False,
+                "joueur1": home,
+                "joueur2": away,
+                "joueur1_id": None,
+                "joueur2_id": None,
+                "joueur1_winner": False,
+                "joueur2_winner": False,
+                "joueur1_sets": 0,
+                "joueur2_sets": 0,
+                "score": "—",
+                "best_of": best_of,
+                "court": "",
+                "note": "",
+                "source": "winamax",
+                "sport_key": sport_key,
+                "cote1": cotes_raw.get(home) or entry.get(_normaliser_nom(home)),
+                "cote2": cotes_raw.get(away) or entry.get(_normaliser_nom(away)),
+                "bookmaker": book_title,
+            })
+
+    matchs.sort(key=lambda m: (
+        m.get("date_paris") or "9999-99-99",
+        m.get("heure_paris") or "99:99",
+        m.get("tournoi") or "",
+        m.get("joueur1") or "",
+    ))
+    return matchs, index_cotes, date_ref
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def obtenir_cotes_tennis_du_jour(api_key: str | None) -> dict:
+    """
+    Index cotes Winamax {(nom1_norm, nom2_norm): {...}} — dérivé du même
+    flux que les matchs Hot Pronostics.
+    """
+    _, index_cotes, _ = obtenir_matchs_tennis_winamax(api_key, 0)
+    return index_cotes
 
 
 def _cotes_pour_match(match: dict, index_cotes: dict) -> dict | None:
@@ -534,7 +731,61 @@ def _cotes_pour_match(match: dict, index_cotes: dict) -> dict | None:
         _normaliser_nom(match["joueur1"]),
         _normaliser_nom(match["joueur2"]),
     ]))
-    return index_cotes.get(cle)
+    hit = index_cotes.get(cle)
+    if hit:
+        return hit
+    # Repli souple : match sur noms de famille
+    j1, j2 = _normaliser_nom(match["joueur1"]), _normaliser_nom(match["joueur2"])
+    for cle_idx, data in (index_cotes or {}).items():
+        if not isinstance(cle_idx, tuple) or len(cle_idx) != 2:
+            continue
+        a, b = cle_idx
+        if (j1 in a or a in j1 or j1.split()[-1] in a) and (j2 in b or b in j2 or j2.split()[-1] in b):
+            return data
+        if (j1 in b or b in j1 or j1.split()[-1] in b) and (j2 in a or a in j2 or j2.split()[-1] in a):
+            return data
+    return None
+
+
+def evaluer_value_bet_tennis(proba_algo_pct, cote, nom_joueur: str, nom_bookmaker: str = "Bookmaker"):
+    """
+    Comme MLB : Value = Proba_Algo - Proba_Implicite(cote).
+      >= +5 → value, <= -5 → evitez, sinon juste.
+    """
+    if not cote or cote <= 1.0 or proba_algo_pct is None:
+        return None, None
+    try:
+        proba_algo = float(proba_algo_pct)
+        cote_f = float(cote)
+    except (TypeError, ValueError):
+        return None, None
+    proba_implicite = (1.0 / cote_f) * 100.0
+    value = proba_algo - proba_implicite
+    if value >= 5:
+        return "value", (
+            f"🟢 Value Bet : {nom_bookmaker} sous-évalue {nom_joueur} "
+            f"(cote {cote_f:.2f}, value +{value:.1f}%)."
+        )
+    if value <= -5:
+        return "evitez", (
+            f"🔴 Pas de value sur {nom_joueur} : cote {nom_bookmaker} {cote_f:.2f} "
+            f"trop basse (value {value:.1f}%)."
+        )
+    return "juste", (
+        f"⚪ Cote juste sur {nom_joueur} ({nom_bookmaker} {cote_f:.2f})."
+    )
+
+
+def classer_value_tennis(proba_algo_pct, cote, nom_joueur: str, bookmaker: str = "Bookmaker"):
+    """Retourne (value_kind, value_label) pour le tableau Hot Pronostics."""
+    niveau, message = evaluer_value_bet_tennis(proba_algo_pct, cote, nom_joueur, bookmaker)
+    if niveau == "value":
+        return "value", "Value forte", message
+    if niveau == "juste":
+        return "medium", "Value moyenne", message
+    if niveau == "evitez":
+        return "avoid", "Pas de value", message
+    return "none", "Pas de value", None
 
 
 # ============================================================
@@ -545,42 +796,21 @@ def predire_probabilite_victoire_tennis(
     rang2: int | None,
     points1: float = 0.0,
     points2: float = 0.0,
-    cote1: float | None = None,
-    cote2: float | None = None,
 ) -> tuple[float, float]:
     """
-    Probabilités de victoire joueur1 / joueur2 (somme = 100).
-
-    1) Signal classement : logistic sur l'écart de rang (et points si dispo)
-    2) Signal marché : probabilités implicites des cotes (si présentes)
-    3) Blend 40% classement / 60% marché quand les cotes existent, sinon 100% classement
+    Probabilités de victoire joueur1 / joueur2 (somme = 100), basées sur le
+    classement uniquement — indépendantes des cotes marché (comme MLB), pour
+    pouvoir détecter une Value Bet proprement.
     """
-    # --- Classement ---
     r1 = rang1 if rang1 and rang1 > 0 else 80
     r2 = rang2 if rang2 and rang2 > 0 else 80
-    # Un meilleur rang (plus petit) → force plus élevée
     force1 = (1.0 / math.sqrt(r1)) + 0.00008 * max(points1, 0.0)
     force2 = (1.0 / math.sqrt(r2)) + 0.00008 * max(points2, 0.0)
-    # Softmax
     exp1 = math.exp(3.2 * force1)
     exp2 = math.exp(3.2 * force2)
-    p_rank1 = 100.0 * exp1 / (exp1 + exp2)
-    p_rank2 = 100.0 - p_rank1
-
-    # --- Marché ---
-    if cote1 and cote2 and cote1 > 1 and cote2 > 1:
-        inv1, inv2 = 1.0 / cote1, 1.0 / cote2
-        total = inv1 + inv2
-        p_mkt1 = 100.0 * inv1 / total
-        p_mkt2 = 100.0 - p_mkt1
-        p1 = 0.40 * p_rank1 + 0.60 * p_mkt1
-        p2 = 100.0 - p1
-    else:
-        p1, p2 = p_rank1, p_rank2
-
+    p1 = 100.0 * exp1 / (exp1 + exp2)
     p1 = max(5.0, min(95.0, p1))
-    p2 = 100.0 - p1
-    return round(p1, 1), round(p2, 1)
+    return round(p1, 1), round(100.0 - p1, 1)
 
 
 def predire_les_deux_gagnent_un_set(proba_favori: float, best_of: int = 3) -> tuple[str, float]:
@@ -622,26 +852,31 @@ def _infos_joueur(nom: str, classements: dict) -> dict:
 # Construction des vues
 # ============================================================
 def _calculer_prediction_match(m: dict, classements: dict, index_cotes: dict) -> dict:
-    """Calcule favori / sets pour un match (réutilisé Résumé + Hot Pronostics)."""
+    """Calcule favori / sets / value pour un match (Résumé + Hot Pronostics)."""
     i1 = _infos_joueur(m["joueur1"], classements)
     i2 = _infos_joueur(m["joueur2"], classements)
     cotes = _cotes_pour_match(m, index_cotes) or {}
     cote1 = cotes.get(_normaliser_nom(m["joueur1"]))
     cote2 = cotes.get(_normaliser_nom(m["joueur2"]))
+    bookmaker = cotes.get("_bookmaker") or "Bookmaker"
 
     p1, p2 = predire_probabilite_victoire_tennis(
         i1.get("rang"), i2.get("rang"),
         i1.get("points") or 0.0, i2.get("points") or 0.0,
-        cote1, cote2,
     )
     if p1 >= p2:
         favori, favori_pct = m["joueur1"], p1
         fav_rang, out_rang = i1.get("rang"), i2.get("rang")
+        cote_fav = cote1
     else:
         favori, favori_pct = m["joueur2"], p2
         fav_rang, out_rang = i2.get("rang"), i1.get("rang")
+        cote_fav = cote2
 
     sets_kind, sets_pct = predire_les_deux_gagnent_un_set(favori_pct, m.get("best_of") or 3)
+    value_kind, value_label, value_msg = classer_value_tennis(
+        favori_pct, cote_fav, favori, bookmaker
+    )
     return {
         "proba_j1": p1,
         "proba_j2": p2,
@@ -653,6 +888,11 @@ def _calculer_prediction_match(m: dict, classements: dict, index_cotes: dict) ->
         "out_rang": out_rang,
         "cote1": cote1,
         "cote2": cote2,
+        "cote_favori": cote_fav,
+        "bookmaker": bookmaker,
+        "value_kind": value_kind,
+        "value_label": value_label,
+        "value_msg": value_msg,
     }
 
 
@@ -775,145 +1015,164 @@ def construire_resume_tennis(cache_bust: int = 0):
 
 def construire_donnees_hot_pronostics_tennis(cache_bust: int = 0):
     """
-    TOUS les matchs de la journée (simples + doubles, tous championnats),
-    avec 2 values : victoire + les 2 gagnent un set.
-    Dès qu'un match a commencé, sa prédiction est FIGÉE (dernière version pré-match).
+    Hot Pronostics tennis : matchs à venir Winamax uniquement.
+    Dès qu'un match n'est plus proposé (démarré / retiré), il disparaît
+    et la liste remonte. Les prédictions restent archivées pour le Résumé.
     """
-    matchs, date_ref = obtenir_matchs_tennis_du_jour(cache_bust)
-    classements = obtenir_classements_tennis()
     api_key = _obtenir_cle_odds_api()
-    index_cotes = obtenir_cotes_tennis_du_jour(api_key)
-    archives = _archives_tennis_journee(date_ref)
+    matchs_a_venir, index_cotes, date_ref = obtenir_matchs_tennis_winamax(api_key, cache_bust)
+    classements = obtenir_classements_tennis()
 
-    cibles = list(matchs)  # tous les matchs, sans filtre simples
+    # ESPN : pour figer les archives quand un match a commencé (hors affichage Hot)
+    try:
+        matchs_espn, _ = obtenir_matchs_tennis_fenetre(cache_bust)
+    except Exception:
+        matchs_espn = []
+
+    historique = _charger_historique_predictions_tennis()
+    archives = {}
+    dates_archives = {date_ref}
+    for m in list(matchs_a_venir) + list(matchs_espn):
+        if m.get("date_paris"):
+            dates_archives.add(m["date_paris"])
+    for d in dates_archives:
+        archives.update(_index_snapshots_tennis((historique.get(d) or {}).get("matches") or []))
+
     lignes = []
     snapshots = []
     maintenant_iso = datetime.now(TZ_PARIS).isoformat()
+    cles_winamax = {_cle_snapshot_tennis(m) for m in matchs_a_venir}
 
-    for m in cibles:
+    # 1) Figer les matchs ESPN commencés + ceux qui ont quitté le board Winamax
+    for m in matchs_espn:
+        if not _match_a_commence_tennis(m):
+            continue
         cle = _cle_snapshot_tennis(m)
         old = archives.get(cle)
-        a_commence = _match_a_commence_tennis(m)
-        utiliser_fige = bool(old and (old.get("fige") or a_commence) and old.get("favori"))
+        if not old or not old.get("favori"):
+            continue
+        snap = dict(old)
+        snap["statut"] = m.get("statut") or snap.get("statut")
+        snap["state"] = m.get("state") or snap.get("state")
+        snap["a_commence"] = True
+        snap["fige"] = True
+        snap["fige_le"] = snap.get("fige_le") or maintenant_iso
+        snap["date_paris"] = m.get("date_paris") or snap.get("date_paris") or date_ref
+        snapshots.append(snap)
 
-        if utiliser_fige:
-            favori = old.get("favori")
-            favori_pct = old.get("favori_pct")
-            sets_kind = old.get("sets_kind") or "NON"
-            sets_pct = old.get("sets_pct")
-            p1 = old.get("proba_j1")
-            p2 = old.get("proba_j2")
-            detail_base = old.get("victoire_detail_base") or "prédiction figée"
-            detail_sets_base = old.get("sets_detail_base") or f"Best-of-{m.get('best_of') or 3}"
-            fige = True
+    for cle, old in archives.items():
+        if cle in cles_winamax:
+            continue
+        if not old or not old.get("favori") or old.get("fige"):
+            continue
+        # Était sur Winamax, plus listé → considéré démarré / retiré
+        snap = dict(old)
+        snap["a_commence"] = True
+        snap["fige"] = True
+        snap["fige_le"] = snap.get("fige_le") or maintenant_iso
+        snap["statut"] = snap.get("statut") or "Retiré Winamax"
+        snapshots.append(snap)
+
+    # 2) Afficher + rafraîchir uniquement les matchs Winamax à venir
+    for m in matchs_a_venir:
+        pred = _calculer_prediction_match(m, classements, index_cotes)
+        favori = pred["favori"]
+        favori_pct = pred["favori_pct"]
+        sets_kind = pred["sets_kind"]
+        sets_pct = pred["sets_pct"]
+        p1, p2 = pred["proba_j1"], pred["proba_j2"]
+        value_kind = pred["value_kind"]
+        value_label = pred["value_label"]
+        value_msg = pred.get("value_msg")
+        cote_favori = pred.get("cote_favori")
+        bookmaker = pred.get("bookmaker") or "Bookmaker"
+        parts = []
+        if pred.get("fav_rang"):
+            parts.append(f"Rang favori #{pred['fav_rang']}")
+        if pred.get("out_rang"):
+            parts.append(f"adv. #{pred['out_rang']}")
+        if cote_favori:
+            parts.append(f"cote {bookmaker} {float(cote_favori):.2f}")
         else:
-            pred = _calculer_prediction_match(m, classements, index_cotes)
-            favori = pred["favori"]
-            favori_pct = pred["favori_pct"]
-            sets_kind = pred["sets_kind"]
-            sets_pct = pred["sets_pct"]
-            p1, p2 = pred["proba_j1"], pred["proba_j2"]
-            parts = []
-            if pred.get("fav_rang"):
-                parts.append(f"Rang favori #{pred['fav_rang']}")
-            if pred.get("out_rang"):
-                parts.append(f"adv. #{pred['out_rang']}")
-            parts.append(
-                "cotes marché intégrées" if (pred.get("cote1") and pred.get("cote2"))
-                else "classement uniquement"
-            )
-            detail_base = " · ".join(parts)
-            detail_sets_base = (
-                f"Best-of-{m.get('best_of') or 3} · "
-                f"{'match équilibré attendu' if sets_kind == 'OUI' else 'écart important → straight sets probable'}"
-            )
-            fige = bool(a_commence)
-
+            parts.append("pas de cote marché")
+        detail_base = " · ".join(parts)
+        detail_sets_base = (
+            f"Best-of-{m.get('best_of') or 3} · "
+            f"{'match équilibré attendu' if sets_kind == 'OUI' else 'écart important → straight sets probable'}"
+        )
         sets_label = f"{sets_kind} ({float(sets_pct):.0f}%)" if sets_pct is not None else str(sets_kind)
-        detail_victoire_txt = detail_base
-        detail_sets_txt = detail_sets_base
-        if fige:
-            detail_victoire_txt = f"🔒 figé · {detail_victoire_txt}"
-            detail_sets_txt = f"🔒 figé · {detail_sets_txt}"
-
-        if m.get("termine"):
-            vainqueur_reel = m["joueur1"] if m.get("joueur1_winner") else (
-                m["joueur2"] if m.get("joueur2_winner") else "—"
-            )
-            ok_victoire = _normaliser_nom(vainqueur_reel) == _normaliser_nom(favori or "")
-            detail_victoire_txt = (
-                f"Résultat : {vainqueur_reel} "
-                f"({'✅' if ok_victoire else '❌'} vs prédit {favori}) · "
-                + detail_victoire_txt
-            )
-            both_sets_reel = m.get("joueur1_sets", 0) > 0 and m.get("joueur2_sets", 0) > 0
-            if m.get("joueur1_sets", 0) + m.get("joueur2_sets", 0) > 0:
-                ok_sets = ((sets_kind or "").upper() == "OUI") == both_sets_reel
-                detail_sets_txt = (
-                    f"Résultat : {'OUI' if both_sets_reel else 'NON'} "
-                    f"({'✅' if ok_sets else '❌'}) · {detail_sets_txt}"
+        statut = m.get("statut") or "À venir"
+        date_paris = m.get("date_paris") or date_ref
+        heure = m.get("heure_paris") or "—"
+        if date_paris and date_paris != date_ref:
+            try:
+                heure_affichee = (
+                    datetime.strptime(date_paris, "%Y-%m-%d").strftime("%d/%m") + f" {heure}"
                 )
+            except ValueError:
+                heure_affichee = f"{date_paris} {heure}"
+        else:
+            heure_affichee = heure
 
-        statut = m.get("statut") or "—"
         lignes.append({
             "confrontation": f"{m['joueur1']} vs {m['joueur2']}",
-            "heure": m.get("heure_paris") or "—",
+            "heure": heure_affichee,
             "tournoi": m.get("tournoi"),
             "tableau": m.get("tableau"),
-            "statut": ("🔒 " if fige else "") + statut,
-            "fige": fige,
+            "statut": statut,
+            "fige": False,
             "favori": favori,
             "favori_pct": favori_pct,
-            "victoire_detail": detail_victoire_txt,
+            "victoire_detail": detail_base,
+            "value_kind": value_kind,
+            "value_label": value_label,
+            "value_msg": value_msg,
+            "cote_favori": cote_favori,
+            "bookmaker": bookmaker,
             "sets_kind": sets_kind,
             "sets_label": sets_label,
             "sets_pct": sets_pct,
-            "sets_detail": detail_sets_txt,
+            "sets_detail": detail_sets_base,
             "proba_j1": p1,
             "proba_j2": p2,
             "joueur1": m["joueur1"],
             "joueur2": m["joueur2"],
             "match_id": m.get("match_id"),
+            "date_paris": date_paris,
+        })
+        snapshots.append({
+            "match_id": m.get("match_id"),
+            "joueur1": m["joueur1"],
+            "joueur2": m["joueur2"],
+            "date_paris": date_paris,
+            "statut": statut,
+            "state": m.get("state"),
+            "a_commence": False,
+            "favori": favori,
+            "favori_pct": favori_pct,
+            "sets_kind": sets_kind,
+            "sets_pct": sets_pct,
+            "proba_j1": p1,
+            "proba_j2": p2,
+            "value_kind": value_kind,
+            "value_label": value_label,
+            "value_msg": value_msg,
+            "cote_favori": cote_favori,
+            "bookmaker": bookmaker,
+            "victoire_detail_base": detail_base,
+            "sets_detail_base": detail_sets_base,
+            "fige": False,
+            "fige_le": None,
         })
 
-        # Snapshot à archiver : si déjà figé on renvoie l'ancien (fusion le conservera)
-        if utiliser_fige and old:
-            snap = dict(old)
-            snap["statut"] = statut
-            snap["state"] = m.get("state")
-            snap["a_commence"] = a_commence
-            snapshots.append(snap)
-        else:
-            snapshots.append({
-                "match_id": m.get("match_id"),
-                "joueur1": m["joueur1"],
-                "joueur2": m["joueur2"],
-                "date_paris": m.get("date_paris") or date_ref,
-                "statut": statut,
-                "state": m.get("state"),
-                "a_commence": a_commence,
-                "favori": favori,
-                "favori_pct": favori_pct,
-                "sets_kind": sets_kind,
-                "sets_pct": sets_pct,
-                "proba_j1": p1,
-                "proba_j2": p2,
-                "victoire_detail_base": detail_base,
-                "sets_detail_base": detail_sets_base,
-                "fige": fige,
-                "fige_le": maintenant_iso if fige else None,
-            })
-
-    # Sauvegarde par date Paris de chaque match (+ date_ref pour la journée)
     par_date: dict[str, list] = {}
     for snap in snapshots:
         d = snap.get("date_paris") or date_ref
         par_date.setdefault(d, []).append(snap)
-    par_date.setdefault(date_ref, snapshots)
     for d, snaps in par_date.items():
         _sauvegarder_predictions_tennis(d, snaps)
 
-    return cibles, lignes, date_ref
+    return matchs_a_venir, lignes, date_ref
 
 
 # ============================================================
@@ -937,15 +1196,18 @@ with st.sidebar:
     st.markdown(
         """
         **Légende Hot Pronostics**
-        - **Victoire** : joueur favori + probabilité
+        - **Source** : matchs à venir Winamax (The-Odds-API)
+        - **À venir uniquement** : retiré dès qu'il quitte Winamax / démarre
+        - **Victoire** : favori algo (classement) + %
+        - **Value** : 🟢 forte / 🟠 moyenne / 🔴 pas de value (vs cote Winamax)
         - **Les 2 gagnent un set** : Oui / Non selon l'équilibre du match
         """
     )
     st.caption(f"Date de référence : {datetime.now(TZ_PARIS).strftime('%Y-%m-%d')} (heure de Paris)")
     if _obtenir_cle_odds_api():
-        st.caption("Cotes marché : The-Odds-API activée")
+        st.caption("Hot Pronostics : calendrier + cotes Winamax")
     else:
-        st.caption("Cotes marché : non configurées (classements seuls)")
+        st.caption("⚠️ Clé Odds-API manquante — Hot Pronostics vide sans Winamax")
 
 onglets = st.tabs(["📊 Résumé", "🔥 Hot Pronostics"], on_change="rerun")
 
@@ -1034,38 +1296,43 @@ with onglets[0]:
 with onglets[1]:
     if onglets[1].open:
         render_section_title(
-            "Hot Pronostics du jour",
-            "Victoire & les deux gagnent un set — tous matchs, tous championnats",
+            "Hot Pronostics — Winamax",
+            "Victoire, Value & les deux gagnent un set — matchs à venir listés chez Winamax",
         )
         if "tennis_hot_bust" not in st.session_state:
             st.session_state.tennis_hot_bust = 0
 
-        with st.spinner("Analyse des matchs du jour (classements ATP/WTA, cotes si dispo)..."):
-            matchs_jour, lignes_recap, date_ref = construire_donnees_hot_pronostics_tennis(
+        if not _obtenir_cle_odds_api():
+            st.warning(
+                "Configure la clé The-Odds-API dans `.streamlit/secrets.toml` "
+                "(`[odds_api]` → `api_key`) pour charger les matchs Winamax."
+            )
+
+        with st.spinner("Chargement des matchs Winamax + classements ATP/WTA..."):
+            matchs_a_venir, lignes_recap, date_ref = construire_donnees_hot_pronostics_tennis(
                 st.session_state.tennis_hot_bust
             )
 
-        if not matchs_jour:
-            st.info("Aucun match tennis à pronostiquer pour aujourd'hui (heure de Paris).")
+        if not matchs_a_venir:
+            st.info("Aucun match tennis à venir chez Winamax pour le moment.")
         else:
-            st.subheader("📋 Tableau de bord du jour")
+            st.subheader("📋 Tableau de bord — Winamax à venir")
             afficher_tableau_recap_hot_pronostics_tennis(lignes_recap)
             st.caption(
-                "Victoire : blend classement ATP/WTA (+ cotes marché si disponibles). "
-                "Les 2 gagnent un set : plus le match est équilibré, plus « Oui » est probable "
-                "(ajusté best-of-3 / best-of-5)."
+                "Victoire : classement ATP/WTA. "
+                "Value : écart algo vs cote Winamax (≥ +5 pts = value forte). "
+                "Les 2 gagnent un set : plus le match est équilibré, plus « Oui » est probable."
             )
             st.caption(
-                "🔒 Dès qu'un match a commencé, sa carte est figée (dernière prédiction pré-match). "
-                "Tous les matchs du jour sont affichés (simples et doubles)."
+                "Liste = matchs encore cotés chez Winamax. Dès qu'un match démarre "
+                "ou disparaît du board, il est retiré et la suite remonte."
             )
             st.caption(
                 "⚠️ Heuristiques automatiques à titre informatif — pas de garantie de résultat."
             )
-            n_figes = sum(1 for r in lignes_recap if r.get("fige"))
             st.caption(
-                f"📅 {len(matchs_jour)} match(s) · {n_figes} figé(s) · date {date_ref} (Paris) · "
-                f"{len({m.get('tournoi') for m in matchs_jour})} tournoi(x)"
+                f"📅 {len(matchs_a_venir)} match(s) Winamax · réf. {date_ref} (Paris) · "
+                f"{len({m.get('tournoi') for m in matchs_a_venir})} tournoi(x)"
             )
 
             st.markdown("---")
@@ -1074,13 +1341,13 @@ with onglets[1]:
             with st.expander("Méthodologie", expanded=False):
                 st.markdown(
                     """
+                    - **Source calendrier** : The-Odds-API, bookmaker **Winamax** uniquement.
                     - **Victoire** : force relative via le rang / points ATP-WTA
-                      (et les cotes h2h The-Odds-API si la clé est dans les secrets).
-                    - **Les 2 gagnent un set** : fonction de l'équilibre du match
-                      (`≈ 74%` à 50/50, diminue quand l'écart de favori grandit).
-                    - Les matchs **commencés** figent la prédiction (🔒) ; les matchs
-                      terminés affichent aussi le résultat réel en détail.
-                    - **Tous** les matchs du jour sont listés (simples et doubles).
+                      (indépendant du marché, comme MLB).
+                    - **Value Bet** : `Proba_Algo − Proba_Implicite(cote Winamax)` ;
+                      ≥ +5 pts = value forte, ≤ −5 = pas de value.
+                    - **Les 2 gagnent un set** : fonction de l'équilibre du match.
+                    - Un match qui quitte Winamax (démarré) disparaît de Hot Pronostics.
                     """
                 )
 

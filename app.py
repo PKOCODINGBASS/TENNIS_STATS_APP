@@ -6,9 +6,10 @@ Même esprit que MLB / NPB / KBO / NHL, avec 2 onglets uniquement :
   - Hot Pronostics (matchs à venir Winamax ; retirés dès qu'ils quittent le board)
 
 Sources :
-  - Scoreboard ESPN (`site.web.api.espn.com`) — calendrier / scores live
+  - Scoreboard ESPN (`site.web.api` / repli `site.api`) — calendrier / scores live
   - Classements ESPN ATP & WTA
-  - Optionnel : cotes h2h The-Odds-API si clé configurée
+  - The-Odds-API (tournois tennis actifs, ex. tennis_atp_cincinnati_open) :
+      Winamax h2h pour Hot Pronostics + repli Résumé si ESPN vide
 """
 
 from __future__ import annotations
@@ -59,12 +60,16 @@ render_footer = _ps_theme.render_footer
 # ---------------------------------------------------------------------------
 # Constantes
 # ---------------------------------------------------------------------------
-ESPN_API = "https://site.web.api.espn.com/apis/site/v2/sports/tennis"
+# ESPN tennis : hosts essayés dans l'ordre (Cloud bloque parfois l'un ou l'autre).
+ESPN_API_BASES = (
+    "https://site.web.api.espn.com/apis/site/v2/sports/tennis",
+    "https://site.api.espn.com/apis/site/v2/sports/tennis",
+)
+ESPN_API = ESPN_API_BASES[0]
 TZ_PARIS = ZoneInfo("Europe/Paris")
 ANNEE_COURANTE = datetime.now(TZ_PARIS).year
 
-# Ligues ESPN à agréger (le scoreboard "all" couvre souvent ATP+WTA du jour ;
-# on déduplique ensuite). Ajouter d'autres slugs s'ils répondent 200.
+# Ligues ESPN à agréger (dédupe ensuite). "all" + tours.
 LIGUES_ESPN = ("all", "atp", "wta")
 
 # Instantanés Hot Pronostics figés dès le début du match (fichier local).
@@ -75,8 +80,15 @@ CHEMIN_HISTORIQUE = os.path.join(
 
 _SESSION = requests.Session()
 _SESSION.headers.update({
-    "User-Agent": "PARIS-SPORTIFS-Tennis-Stats-App/1.0",
-    "Accept": "application/json",
+    # UA navigateur : certains CDN ESPN renvoient un scoreboard vide / 403 sinon.
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+    ),
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
+    "Referer": "https://www.espn.com/tennis/scoreboard",
+    "Origin": "https://www.espn.com",
 })
 
 
@@ -262,17 +274,38 @@ def _obtenir_cle_odds_api() -> str | None:
 # ============================================================
 # Données ESPN — scoreboard & classements
 # ============================================================
+def _espn_get_json(path: str, params: dict | None = None) -> dict:
+    """GET JSON sur le premier host ESPN qui répond correctement."""
+    derniere = None
+    for base in ESPN_API_BASES:
+        url = f"{base}/{path.lstrip('/')}"
+        try:
+            return appeler_avec_retry(_get_json, url, params=params)
+        except Exception as exc:
+            derniere = exc
+            continue
+    if derniere:
+        raise derniere
+    return {}
+
+
 @st.cache_data(show_spinner=False, ttl=180)
 def _charger_scoreboard_espn(ligue: str, dates: str | None = None) -> dict:
-    params = {"dates": dates} if dates else None
-    return appeler_avec_retry(_get_json, f"{ESPN_API}/{ligue}/scoreboard", params=params)
+    params = {"dates": dates, "lang": "en", "region": "us"} if dates else {
+        "lang": "en", "region": "us",
+    }
+    try:
+        data = _espn_get_json(f"{ligue}/scoreboard", params=params)
+    except Exception:
+        return {"events": []}
+    return data if isinstance(data, dict) else {"events": []}
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
 def _charger_classement_espn(tour: str) -> dict:
     """tour = 'atp' ou 'wta' → {nom_normalise: {rang, points, nom}}."""
     try:
-        data = appeler_avec_retry(_get_json, f"{ESPN_API}/{tour}/rankings")
+        data = _espn_get_json(f"{tour}/rankings", params={"lang": "en", "region": "us"})
     except Exception:
         return {}
     ranking = (data.get("rankings") or [{}])[0]
@@ -425,7 +458,7 @@ def _extraire_matchs_depuis_scoreboard(data: dict, ligue_slug: str) -> list[dict
 
 
 @st.cache_data(show_spinner=False, ttl=180)
-def obtenir_matchs_tennis_du_jour(cache_bust: int = 0, _cache_version: int = 5) -> tuple[list[dict], str]:
+def obtenir_matchs_tennis_du_jour(cache_bust: int = 0, _cache_version: int = 7) -> tuple[list[dict], str]:
     """
     Agrège les matchs du jour calendaire Paris uniquement : de 00:00 à 23:59
     (heure de Paris), tous championnats ESPN. Aucun match de la veille.
@@ -437,32 +470,34 @@ def obtenir_matchs_tennis_du_jour(cache_bust: int = 0, _cache_version: int = 5) 
     fin_jour = maintenant.replace(hour=23, minute=59, second=59, microsecond=999999)
     vus = set()
     matchs = []
+    d0 = maintenant.strftime("%Y%m%d")
     for ligue in LIGUES_ESPN:
-        try:
-            data = _charger_scoreboard_espn(ligue)
-        except Exception:
-            continue
-        for m in _extraire_matchs_depuis_scoreboard(data, ligue):
-            # Fenêtre stricte : minuit → 23:59 heure de Paris le jour même
-            date_iso = m.get("date_iso") or ""
-            dt_paris = None
-            if date_iso:
-                try:
-                    dt_paris = datetime.fromisoformat(
-                        date_iso.replace("Z", "+00:00")
-                    ).astimezone(TZ_PARIS)
-                except Exception:
-                    dt_paris = None
-            if dt_paris is not None:
-                if not (debut_jour <= dt_paris <= fin_jour):
+        for dates_param in (None, d0):
+            try:
+                data = _charger_scoreboard_espn(ligue, dates_param)
+            except Exception:
+                continue
+            for m in _extraire_matchs_depuis_scoreboard(data, ligue):
+                # Fenêtre stricte : minuit → 23:59 heure de Paris le jour même
+                date_iso = m.get("date_iso") or ""
+                dt_paris = None
+                if date_iso:
+                    try:
+                        dt_paris = datetime.fromisoformat(
+                            date_iso.replace("Z", "+00:00")
+                        ).astimezone(TZ_PARIS)
+                    except Exception:
+                        dt_paris = None
+                if dt_paris is not None:
+                    if not (debut_jour <= dt_paris <= fin_jour):
+                        continue
+                elif (m.get("date_paris") or "") != aujourdhui:
                     continue
-            elif (m.get("date_paris") or "") != aujourdhui:
-                continue
-            cle = (m["match_id"], m["joueur1"], m["joueur2"])
-            if cle in vus:
-                continue
-            vus.add(cle)
-            matchs.append(m)
+                cle = (m["match_id"], m["joueur1"], m["joueur2"])
+                if cle in vus:
+                    continue
+                vus.add(cle)
+                matchs.append(m)
 
     # Ordre : live → à venir → terminés, puis heure
     ordre_state = {"in": 0, "pre": 1, "post": 2}
@@ -478,7 +513,7 @@ def obtenir_matchs_tennis_du_jour(cache_bust: int = 0, _cache_version: int = 5) 
 def obtenir_matchs_tennis_fenetre(
     cache_bust: int = 0,
     jours_ahead: int = 7,
-    _cache_version: int = 2,
+    _cache_version: int = 4,
 ) -> tuple[list[dict], str]:
     """
     Matchs ESPN sur la fenêtre aujourd'hui (Paris) → +jours_ahead
@@ -493,7 +528,7 @@ def obtenir_matchs_tennis_fenetre(
     vus = set()
     matchs = []
     for ligue in LIGUES_ESPN:
-        for dates_param in (None, f"{d0}-{d1}"):
+        for dates_param in (None, f"{d0}-{d1}", d0):
             try:
                 data = _charger_scoreboard_espn(ligue, dates_param)
             except Exception:
@@ -566,9 +601,13 @@ def _extraire_cotes_h2h(bookmaker: dict) -> dict:
     return cotes_raw
 
 
-@st.cache_data(show_spinner=False, ttl=900)
+@st.cache_data(show_spinner=False, ttl=600)
 def _lister_sports_tennis_odds_api(api_key: str) -> list[dict]:
-    """Sports tennis actifs côté The-Odds-API."""
+    """
+    Sports tennis actifs côté The-Odds-API.
+    Les clés sont désormais par tournoi (ex. tennis_atp_cincinnati_open),
+    plus un sport générique unique.
+    """
     if not api_key:
         return []
     try:
@@ -579,19 +618,217 @@ def _lister_sports_tennis_odds_api(api_key: str) -> list[dict]:
         )
     except Exception:
         return []
-    return [
-        s for s in (sports or [])
-        if s.get("active") and (
-            s.get("group") == "Tennis" or str(s.get("key", "")).startswith("tennis_")
+    out = []
+    for s in sports or []:
+        key = str(s.get("key") or "")
+        group = str(s.get("group") or "").strip().lower()
+        if not key.startswith("tennis_") and group != "tennis":
+            continue
+        # Prefer active; keep inactive only if title looks like current tour events
+        if s.get("active"):
+            out.append(s)
+    # Si rien d'actif (entre deux tournois) : retenter sans filtre active
+    if not out:
+        out = [
+            s for s in (sports or [])
+            if str(s.get("key") or "").startswith("tennis_")
+            or str(s.get("group") or "").strip().lower() == "tennis"
+        ]
+    out.sort(key=lambda s: (s.get("key") or ""))
+    return out
+
+
+def _fetch_odds_events_tennis(sport_key: str, api_key: str) -> list[dict]:
+    """
+    Événements h2h pour un sport tennis.
+    1) filtre bookmakers Winamax côté API
+    2) repli : tous bookmakers EU, puis filtre Winamax en local
+    """
+    params_base = {
+        "apiKey": api_key,
+        "regions": "eu",
+        "markets": "h2h",
+        "oddsFormat": "decimal",
+    }
+    try:
+        events = appeler_avec_retry(
+            _get_json,
+            f"{ODDS_API_BASE}/sports/{sport_key}/odds",
+            {**params_base, "bookmakers": ",".join(BOOKMAKERS_WINAMAX)},
         )
-    ]
+    except Exception:
+        events = []
+    if events:
+        return events or []
+    try:
+        events = appeler_avec_retry(
+            _get_json,
+            f"{ODDS_API_BASE}/sports/{sport_key}/odds",
+            params_base,
+        )
+    except Exception:
+        return []
+    return events or []
 
 
-@st.cache_data(show_spinner=False, ttl=900)
-def obtenir_matchs_tennis_winamax(
+@st.cache_data(show_spinner=False, ttl=180)
+def obtenir_matchs_tennis_odds_du_jour(
     api_key: str | None,
     cache_bust: int = 0,
     _cache_version: int = 1,
+) -> list[dict]:
+    """
+    Repli Résumé : scores + cotes The-Odds-API pour la journée Paris.
+    Couvre les tournois dont la clé sport est active (ATP/WTA Open, etc.).
+    """
+    del cache_bust, _cache_version
+    if not api_key:
+        return []
+    aujourdhui = datetime.now(TZ_PARIS).strftime("%Y-%m-%d")
+    sports = _lister_sports_tennis_odds_api(api_key)
+    matchs = []
+    vus = set()
+
+    for sport in sports:
+        sport_key = sport.get("key") or ""
+        tournoi = sport.get("title") or sport.get("description") or sport_key
+        ligue = "ATP" if "atp" in sport_key else ("WTA" if "wta" in sport_key else "TENNIS")
+
+        # Scores (terminés / live récents)
+        try:
+            scores = appeler_avec_retry(
+                _get_json,
+                f"{ODDS_API_BASE}/sports/{sport_key}/scores",
+                {"apiKey": api_key, "daysFrom": 1},
+            )
+        except Exception:
+            scores = []
+        for ev in scores or []:
+            home = (ev.get("home_team") or "").strip()
+            away = (ev.get("away_team") or "").strip()
+            if not home or not away:
+                continue
+            commence = ev.get("commence_time") or ""
+            date_paris, heure_paris = "", ""
+            if commence:
+                try:
+                    dt = datetime.fromisoformat(commence.replace("Z", "+00:00")).astimezone(TZ_PARIS)
+                    date_paris = dt.strftime("%Y-%m-%d")
+                    heure_paris = dt.strftime("%H:%M")
+                except Exception:
+                    pass
+            if date_paris != aujourdhui:
+                continue
+            completed = bool(ev.get("completed"))
+            score_map = {
+                (s.get("name") or ""): s.get("score")
+                for s in (ev.get("scores") or [])
+                if s.get("name")
+            }
+            try:
+                s1 = int(float(score_map[home])) if score_map.get(home) is not None else 0
+                s2 = int(float(score_map[away])) if score_map.get(away) is not None else 0
+            except (TypeError, ValueError):
+                s1 = s2 = 0
+            mid = str(ev.get("id") or f"odds-score-{sport_key}-{home}-{away}-{date_paris}")
+            cle = (_normaliser_nom(home), _normaliser_nom(away), date_paris)
+            if cle in vus:
+                continue
+            vus.add(cle)
+            matchs.append({
+                "match_id": mid,
+                "ligue": ligue,
+                "tournoi": tournoi,
+                "tableau": "Singles",
+                "slug_tableau": "singles",
+                "est_simple": True,
+                "est_double": False,
+                "date_iso": commence,
+                "date_paris": date_paris,
+                "heure_paris": heure_paris,
+                "statut": "Final" if completed else "En cours / programmé",
+                "state": "post" if completed else ("in" if score_map else "pre"),
+                "termine": completed,
+                "joueur1": home,
+                "joueur2": away,
+                "joueur1_id": None,
+                "joueur2_id": None,
+                "joueur1_winner": completed and s1 > s2,
+                "joueur2_winner": completed and s2 > s1,
+                "joueur1_sets": s1,
+                "joueur2_sets": s2,
+                "score": f"{s1}-{s2}" if completed or score_map else "—",
+                "best_of": 3,
+                "court": "",
+                "note": "",
+                "source": "odds_api",
+            })
+
+        # À venir via odds (complète les matchs pas encore dans scores)
+        for ev in _fetch_odds_events_tennis(sport_key, api_key):
+            home = (ev.get("home_team") or "").strip()
+            away = (ev.get("away_team") or "").strip()
+            if not home or not away:
+                continue
+            commence = ev.get("commence_time") or ""
+            date_paris, heure_paris = "", ""
+            if commence:
+                try:
+                    dt = datetime.fromisoformat(commence.replace("Z", "+00:00")).astimezone(TZ_PARIS)
+                    date_paris = dt.strftime("%Y-%m-%d")
+                    heure_paris = dt.strftime("%H:%M")
+                except Exception:
+                    pass
+            if date_paris != aujourdhui:
+                continue
+            cle = (_normaliser_nom(home), _normaliser_nom(away), date_paris)
+            if cle in vus:
+                continue
+            vus.add(cle)
+            mid = str(ev.get("id") or f"odds-{sport_key}-{home}-{away}-{commence}")
+            matchs.append({
+                "match_id": mid,
+                "ligue": ligue,
+                "tournoi": tournoi,
+                "tableau": "Singles",
+                "slug_tableau": "singles",
+                "est_simple": True,
+                "est_double": False,
+                "date_iso": commence,
+                "date_paris": date_paris,
+                "heure_paris": heure_paris,
+                "statut": "À venir",
+                "state": "pre",
+                "termine": False,
+                "joueur1": home,
+                "joueur2": away,
+                "joueur1_id": None,
+                "joueur2_id": None,
+                "joueur1_winner": False,
+                "joueur2_winner": False,
+                "joueur1_sets": 0,
+                "joueur2_sets": 0,
+                "score": "—",
+                "best_of": 3,
+                "court": "",
+                "note": "",
+                "source": "odds_api",
+            })
+
+    ordre_state = {"in": 0, "pre": 1, "post": 2}
+    matchs.sort(key=lambda m: (
+        ordre_state.get(m.get("state"), 9),
+        m.get("heure_paris") or "99:99",
+        m.get("tournoi") or "",
+    ))
+    return matchs
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def obtenir_matchs_tennis_winamax(
+    api_key: str | None,
+    cache_bust: int = 0,
+    _cache_version: int = 3,
 ) -> tuple[list[dict], dict, str]:
     """
     Source Hot Pronostics : matchs à venir proposés par Winamax (The-Odds-API).
@@ -612,20 +849,7 @@ def obtenir_matchs_tennis_winamax(
     for sport in sports:
         sport_key = sport.get("key") or ""
         tournoi = sport.get("title") or sport.get("description") or sport_key
-        try:
-            events = appeler_avec_retry(
-                _get_json,
-                f"{ODDS_API_BASE}/sports/{sport_key}/odds",
-                {
-                    "apiKey": api_key,
-                    "regions": "eu",
-                    "markets": "h2h",
-                    "oddsFormat": "decimal",
-                    "bookmakers": ",".join(BOOKMAKERS_WINAMAX),
-                },
-            )
-        except Exception:
-            continue
+        events = _fetch_odds_events_tennis(sport_key, api_key)
 
         for ev in events or []:
             home = (ev.get("home_team") or "").strip()
@@ -642,7 +866,6 @@ def obtenir_matchs_tennis_winamax(
             commence = ev.get("commence_time") or ""
             heure_paris = ""
             date_paris = ""
-            dt_paris = None
             if commence:
                 try:
                     dt_paris = datetime.fromisoformat(
@@ -960,6 +1183,13 @@ def construire_resume_tennis(cache_bust: int = 0):
             datetime.now(TZ_PARIS).strftime("%Y-%m-%d"),
         )
 
+    # Repli The-Odds-API si ESPN ne renvoie rien (fréquent sur Streamlit Cloud)
+    if not matchs:
+        try:
+            matchs = obtenir_matchs_tennis_odds_du_jour(_obtenir_cle_odds_api(), cache_bust)
+        except Exception:
+            matchs = []
+
     classements = obtenir_classements_tennis()
     index_cotes = obtenir_cotes_tennis_du_jour(_obtenir_cle_odds_api())
     archives = _archives_tennis_journee(date_ref)
@@ -1224,11 +1454,14 @@ with onglets[0]:
             st.session_state.tennis_resume_bust += 1
             try:
                 obtenir_matchs_tennis_du_jour.clear()
+                obtenir_matchs_tennis_odds_du_jour.clear()
                 _charger_scoreboard_espn.clear()
+                _lister_sports_tennis_odds_api.clear()
+                obtenir_matchs_tennis_winamax.clear()
             except Exception:
                 pass
 
-        with st.spinner("Récupération des scores tennis (ESPN)..."):
+        with st.spinner("Récupération des scores tennis (ESPN / Odds-API)..."):
             df_resume, df_termines, err, date_ref = construire_resume_tennis(
                 st.session_state.tennis_resume_bust
             )

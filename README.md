@@ -2,6 +2,13 @@
 
 Application Streamlit tennis (ATP / WTA), sur le même modèle que MLB / NPB / KBO / NHL.
 
+## Sources API
+
+- **ESPN** (`site.web.api.espn.com`, repli `site.api.espn.com`) — scoreboard & classements ATP/WTA  
+- **The-Odds-API** — sports tennis **par tournoi** (ex. `tennis_atp_cincinnati_open`, `tennis_wta_cincinnati_open`)  
+  - Hot Pronostics : marchés h2h **Winamax** (`winamax_fr`)  
+  - Résumé : repli scores/cotes si ESPN est vide  
+
 ## Onglets
 
 1. **Résumé** — tous les matchs du jour (heure de Paris), tous championnats
@@ -29,4 +36,4 @@ streamlit run app.py
 api_key = "..."
 ```
 
-Sans clé, les pronostics s’appuient uniquement sur les classements ESPN ATP/WTA.
+Sans clé, le Résumé repose sur ESPN seul ; Hot Pronostics nécessite Winamax via Odds-API.

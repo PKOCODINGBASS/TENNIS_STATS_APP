@@ -879,6 +879,7 @@ def afficher_tableau_recap_hot_pronostics_tennis(rows: list) -> None:
                 meta = " · ".join(
                     x for x in (
                         row.get("heure"),
+                        row.get("tournoi"),
                         row.get("tableau"),
                         row.get("statut"),
                         "figé" if row.get("fige") else "",

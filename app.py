@@ -116,6 +116,23 @@ def _match_a_commence_tennis(match_ou_statut) -> bool:
     return False
 
 
+def _debut_match_paris(m: dict) -> datetime | None:
+    """Horodatage de début du match en heure de Paris, si connu."""
+    iso = (m.get("date_iso") or "").strip()
+    if not iso:
+        return None
+    try:
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(TZ_PARIS)
+    except Exception:
+        return None
+
+
+def _paire_joueurs_tennis(m: dict) -> tuple[str, str]:
+    j1 = _normaliser_nom(m.get("joueur1") or "")
+    j2 = _normaliser_nom(m.get("joueur2") or "")
+    return tuple(sorted([j1, j2]))
+
+
 def _match_annule_ou_reporte_tennis(m: dict) -> bool:
     statut = (m.get("statut") or "").strip().lower()
     return any(x in statut for x in (
@@ -129,14 +146,18 @@ def _match_est_a_venir_tennis(m: dict) -> bool:
         return False
     if _match_annule_ou_reporte_tennis(m):
         return False
+    debut = _debut_match_paris(m)
+    if debut is not None:
+        # Winamax laisse parfois des matchs live sur le board : on coupe 5 min après le tip-off.
+        if debut < datetime.now(TZ_PARIS) - timedelta(minutes=5):
+            return False
     return True
 
 
 def _cle_snapshot_tennis(m: dict) -> str:
     """Clé stable joueurs + date (indépendante ESPN / Winamax)."""
-    j1 = _normaliser_nom(m.get("joueur1") or "")
-    j2 = _normaliser_nom(m.get("joueur2") or "")
-    paire = "|".join(sorted([j1, j2]))
+    j1, j2 = _paire_joueurs_tennis(m)
+    paire = "|".join([j1, j2])
     return f"p:{paire}|{m.get('date_paris') or ''}"
 
 
@@ -828,13 +849,13 @@ def obtenir_matchs_tennis_odds_du_jour(
 def obtenir_matchs_tennis_winamax(
     api_key: str | None,
     cache_bust: int = 0,
-    _cache_version: int = 3,
+    _cache_version: int = 4,
 ) -> tuple[list[dict], dict, str]:
     """
     Source Hot Pronostics : matchs à venir proposés par Winamax (The-Odds-API).
 
     Retourne (matchs, index_cotes, date_ref_paris).
-    Un match n'apparaît que s'il a un marché h2h Winamax.
+    Un match n'apparaît que s'il a un marché h2h Winamax et n'a pas encore démarré.
     """
     del cache_bust, _cache_version
     date_ref = datetime.now(TZ_PARIS).strftime("%Y-%m-%d")
@@ -929,6 +950,9 @@ def obtenir_matchs_tennis_winamax(
                 "cote2": cotes_raw.get(away) or entry.get(_normaliser_nom(away)),
                 "bookmaker": book_title,
             })
+
+    # Coupe les matchs déjà tippés (Odds-API les laisse parfois cotés en live)
+    matchs = [m for m in matchs if _match_est_a_venir_tennis(m)]
 
     matchs.sort(key=lambda m: (
         m.get("date_paris") or "9999-99-99",
@@ -1258,6 +1282,18 @@ def construire_donnees_hot_pronostics_tennis(cache_bust: int = 0):
         matchs_espn, _ = obtenir_matchs_tennis_fenetre(cache_bust)
     except Exception:
         matchs_espn = []
+
+    # Retire aussi les confrontations déjà live/terminées côté ESPN
+    paires_espn_commencees = {
+        _paire_joueurs_tennis(em)
+        for em in matchs_espn
+        if _match_a_commence_tennis(em) and _paire_joueurs_tennis(em) != ("", "")
+    }
+    matchs_a_venir = [
+        m for m in matchs_a_venir
+        if _match_est_a_venir_tennis(m)
+        and _paire_joueurs_tennis(m) not in paires_espn_commencees
+    ]
 
     historique = _charger_historique_predictions_tennis()
     archives = {}

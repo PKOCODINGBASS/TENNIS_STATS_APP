@@ -1024,7 +1024,7 @@ def evaluer_value_bet_tennis(proba_algo_pct, cote, nom_joueur: str, nom_bookmake
 
 
 def classer_value_tennis(proba_algo_pct, cote, nom_joueur: str, bookmaker: str = "Bookmaker"):
-    """Retourne (value_kind, value_label) pour le tableau Hot Pronostics."""
+    """Retourne (value_kind, value_label, value_msg) pour le tableau Hot Pronostics."""
     niveau, message = evaluer_value_bet_tennis(proba_algo_pct, cote, nom_joueur, bookmaker)
     if niveau == "value":
         return "value", "Value forte", message
@@ -1033,6 +1033,53 @@ def classer_value_tennis(proba_algo_pct, cote, nom_joueur: str, bookmaker: str =
     if niveau == "evitez":
         return "avoid", "Pas de value", message
     return "none", "Pas de value", None
+
+
+def _favori_pct_implicite_marche(cote1, cote2) -> float | None:
+    """% du favori marché (dévigé) à partir des cotes h2h Winamax."""
+    try:
+        c1, c2 = float(cote1), float(cote2)
+    except (TypeError, ValueError):
+        return None
+    if c1 <= 1.0 or c2 <= 1.0:
+        return None
+    i1, i2 = 1.0 / c1, 1.0 / c2
+    tot = i1 + i2
+    if tot <= 0:
+        return None
+    p1 = 100.0 * i1 / tot
+    return max(p1, 100.0 - p1)
+
+
+def classer_value_sets_tennis(
+    sets_kind: str,
+    sets_pct_oui: float | None,
+    favori_marche_pct: float | None,
+    best_of: int = 3,
+    bookmaker: str = "Bookmaker",
+) -> tuple[str, str, str | None]:
+    """
+    Value sur « les 2 gagnent un set » (OUI/NON).
+
+    Odds-API n'expose pas ce marché : on compare notre proba à la proba
+    implicite dérivée de l'équilibre h2h Winamax (même modèle d'écart).
+    """
+    if sets_pct_oui is None or favori_marche_pct is None:
+        return "none", "Pas de value", None
+    _, marche_oui = predire_les_deux_gagnent_un_set(favori_marche_pct, best_of)
+    kind = (sets_kind or "").upper()
+    if kind == "OUI":
+        proba_algo = float(sets_pct_oui)
+        proba_marche = float(marche_oui)
+        nom = "OUI (les 2 gagnent un set)"
+    else:
+        proba_algo = 100.0 - float(sets_pct_oui)
+        proba_marche = 100.0 - float(marche_oui)
+        nom = "NON (straight sets)"
+    if proba_marche <= 0.5:
+        return "none", "Pas de value", None
+    cote_synth = 100.0 / proba_marche
+    return classer_value_tennis(proba_algo, cote_synth, nom, bookmaker)
 
 
 # ============================================================
@@ -1124,6 +1171,14 @@ def _calculer_prediction_match(m: dict, classements: dict, index_cotes: dict) ->
     value_kind, value_label, value_msg = classer_value_tennis(
         favori_pct, cote_fav, favori, bookmaker
     )
+    favori_marche_pct = _favori_pct_implicite_marche(cote1, cote2)
+    sets_value_kind, sets_value_label, sets_value_msg = classer_value_sets_tennis(
+        sets_kind,
+        sets_pct,
+        favori_marche_pct,
+        m.get("best_of") or 3,
+        bookmaker,
+    )
     return {
         "proba_j1": p1,
         "proba_j2": p2,
@@ -1140,6 +1195,9 @@ def _calculer_prediction_match(m: dict, classements: dict, index_cotes: dict) ->
         "value_kind": value_kind,
         "value_label": value_label,
         "value_msg": value_msg,
+        "sets_value_kind": sets_value_kind,
+        "sets_value_label": sets_value_label,
+        "sets_value_msg": sets_value_msg,
     }
 
 
@@ -1333,6 +1391,9 @@ def construire_donnees_hot_pronostics_tennis(cache_bust: int = 0):
         value_kind = pred["value_kind"]
         value_label = pred["value_label"]
         value_msg = pred.get("value_msg")
+        sets_value_kind = pred.get("sets_value_kind") or "none"
+        sets_value_label = pred.get("sets_value_label") or "Pas de value"
+        sets_value_msg = pred.get("sets_value_msg")
         cote_favori = pred.get("cote_favori")
         bookmaker = pred.get("bookmaker") or "Bookmaker"
         parts = []
@@ -1390,6 +1451,9 @@ def construire_donnees_hot_pronostics_tennis(cache_bust: int = 0):
             "sets_label": sets_label,
             "sets_pct": sets_pct,
             "sets_detail": detail_sets_base,
+            "sets_value_kind": sets_value_kind,
+            "sets_value_label": sets_value_label,
+            "sets_value_msg": sets_value_msg,
             "proba_j1": p1,
             "proba_j2": p2,
             "joueur1": m["joueur1"],
@@ -1414,6 +1478,9 @@ def construire_donnees_hot_pronostics_tennis(cache_bust: int = 0):
             "value_kind": value_kind,
             "value_label": value_label,
             "value_msg": value_msg,
+            "sets_value_kind": sets_value_kind,
+            "sets_value_label": sets_value_label,
+            "sets_value_msg": sets_value_msg,
             "cote_favori": cote_favori,
             "bookmaker": bookmaker,
             "victoire_detail_base": detail_base,
@@ -1593,8 +1660,8 @@ with onglets[1]:
                 st.error(f"Erreur d'affichage du tableau : {type(exc).__name__}: {exc}")
             st.caption(
                 "Victoire : classement ATP/WTA. "
-                "Value : écart algo vs cote Winamax (≥ +5 pts = value forte). "
-                "Les 2 gagnent un set : plus le match est équilibré, plus « Oui » est probable."
+                "Value victoire : écart algo vs cote Winamax (≥ +5 pts = value forte). "
+                "Les 2 gagnent un set : équilibre du match + value vs équilibre implicite Winamax."
             )
             st.caption(
                 "Liste = matchs encore cotés chez Winamax. Dès qu'un match démarre "

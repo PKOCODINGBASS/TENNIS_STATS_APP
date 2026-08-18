@@ -849,7 +849,7 @@ def afficher_tableau_recap_hot_pronostics_tennis(rows: list) -> None:
     """
     Tableau Hot Pronostics tennis :
       1) Victoire (favori + %) + Value Bet
-      2) Les deux gagnent un set (Oui / Non + %)
+      2) Les deux gagnent un set (Oui / Non + %) + Value
     """
     if not rows:
         st.info("Aucun match à afficher dans le tableau de bord du jour.")
@@ -861,8 +861,8 @@ def afficher_tableau_recap_hot_pronostics_tennis(rows: list) -> None:
         "avoid": "🔴",
         "none": "⚪",
     }
-    widths = [1.3, 1.2, 1.0]
-    headers = ["Confrontation", "Victoire & Value", "Les 2 gagnent un set"]
+    widths = [1.3, 1.2, 1.15]
+    headers = ["Confrontation", "Victoire & Value", "2 gagnent un set & Value"]
     header_cols = st.columns(widths)
     for col, title in zip(header_cols, headers):
         with col:
@@ -906,10 +906,14 @@ def afficher_tableau_recap_hot_pronostics_tennis(rows: list) -> None:
                     st.caption(str(row["victoire_detail"]))
             with c3:
                 kind = (row.get("sets_kind") or "").upper()
-                emoji = "🟢" if kind == "OUI" else ("🔴" if kind == "NON" else "⚪")
+                emoji_sets = "🟢" if kind == "OUI" else ("🔴" if kind == "NON" else "⚪")
                 label = row.get("sets_label") or kind or "—"
-                st.markdown(f"**{emoji} {label}**")
-                if row.get("sets_detail"):
+                st.markdown(f"**{emoji_sets} {label}**")
+                emoji_v = value_emoji.get(row.get("sets_value_kind") or "none", "⚪")
+                st.caption(f"{emoji_v} {row.get('sets_value_label') or 'Pas de value'}")
+                if row.get("sets_value_msg"):
+                    st.caption(str(row["sets_value_msg"]))
+                elif row.get("sets_detail"):
                     st.caption(str(row["sets_detail"]))
 
 
@@ -1032,7 +1036,14 @@ def repondre_question_hot_pronostics_tennis(question: str, lignes_recap: list) -
 
     if veut_sets_oui or (not veut_favori and not veut_value and not veut_straight and "set" in q):
         oui = [r for r in lignes if (r.get("sets_kind") or "").upper() == "OUI"]
-        oui.sort(key=lambda r: float(r.get("sets_pct") or 0), reverse=True)
+        # Priorise les OUI avec value sets
+        ordre = {"value": 0, "medium": 1, "avoid": 2, "none": 3}
+        oui.sort(
+            key=lambda r: (
+                ordre.get(r.get("sets_value_kind") or "none", 9),
+                -float(r.get("sets_pct") or 0),
+            )
+        )
         top = oui[:n]
         if not top:
             parties.append("Aucun match classé « les 2 gagnent un set » pour le moment.")
@@ -1043,7 +1054,14 @@ def repondre_question_hot_pronostics_tennis(question: str, lignes_recap: list) -
                     pct = f"{float(row.get('sets_pct')):.0f}%"
                 except (TypeError, ValueError):
                     pct = "—"
-                out.append(f"{i}. **{row.get('confrontation')}** — {pct} ({row.get('tournoi') or ''})")
+                emoji = {"value": "🟢", "medium": "🟠", "avoid": "🔴"}.get(
+                    row.get("sets_value_kind"), "⚪"
+                )
+                out.append(
+                    f"{i}. {emoji} **{row.get('confrontation')}** — {pct} · "
+                    f"{row.get('sets_value_label') or 'Pas de value'} "
+                    f"({row.get('tournoi') or ''})"
+                )
             parties.append("\n".join(out))
 
     if veut_straight:

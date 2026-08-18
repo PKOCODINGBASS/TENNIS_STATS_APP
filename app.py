@@ -1272,35 +1272,32 @@ def construire_donnees_hot_pronostics_tennis(cache_bust: int = 0):
     Hot Pronostics tennis : matchs à venir Winamax uniquement.
     Dès qu'un match n'est plus proposé (démarré / retiré), il disparaît
     et la liste remonte. Les prédictions restent archivées pour le Résumé.
+
+    Note : on n'appelle PAS le scoreboard ESPN complet ici (trop lourd sur Cloud :
+    timeout / OOM). Le filtre « à venir » repose sur l'heure de tip-off Winamax.
     """
     api_key = _obtenir_cle_odds_api()
     matchs_a_venir, index_cotes, date_ref = obtenir_matchs_tennis_winamax(api_key, cache_bust)
-    classements = obtenir_classements_tennis()
-
-    # ESPN : pour figer les archives quand un match a commencé (hors affichage Hot)
     try:
-        matchs_espn, _ = obtenir_matchs_tennis_fenetre(cache_bust)
+        classements = obtenir_classements_tennis()
     except Exception:
-        matchs_espn = []
+        classements = {}
 
-    # Retire aussi les confrontations déjà live/terminées côté ESPN
-    paires_espn_commencees = {
-        _paire_joueurs_tennis(em)
-        for em in matchs_espn
-        if _match_a_commence_tennis(em) and _paire_joueurs_tennis(em) != ("", "")
-    }
-    matchs_a_venir = [
-        m for m in matchs_a_venir
-        if _match_est_a_venir_tennis(m)
-        and _paire_joueurs_tennis(m) not in paires_espn_commencees
-    ]
+    # Sécurité : ne garder que les matchs vraiment à venir (tip-off)
+    matchs_a_venir = [m for m in matchs_a_venir if _match_est_a_venir_tennis(m)]
 
     historique = _charger_historique_predictions_tennis()
     archives = {}
     dates_archives = {date_ref}
-    for m in list(matchs_a_venir) + list(matchs_espn):
+    for m in matchs_a_venir:
         if m.get("date_paris"):
             dates_archives.add(m["date_paris"])
+    # Inclure hier pour figer les matchs qui ont quitté le board
+    try:
+        hier = (datetime.strptime(date_ref, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+        dates_archives.add(hier)
+    except ValueError:
+        pass
     for d in dates_archives:
         archives.update(_index_snapshots_tennis((historique.get(d) or {}).get("matches") or []))
 
@@ -1309,29 +1306,12 @@ def construire_donnees_hot_pronostics_tennis(cache_bust: int = 0):
     maintenant_iso = datetime.now(TZ_PARIS).isoformat()
     cles_winamax = {_cle_snapshot_tennis(m) for m in matchs_a_venir}
 
-    # 1) Figer les matchs ESPN commencés + ceux qui ont quitté le board Winamax
-    for m in matchs_espn:
-        if not _match_a_commence_tennis(m):
-            continue
-        cle = _cle_snapshot_tennis(m)
-        old = archives.get(cle)
-        if not old or not old.get("favori"):
-            continue
-        snap = dict(old)
-        snap["statut"] = m.get("statut") or snap.get("statut")
-        snap["state"] = m.get("state") or snap.get("state")
-        snap["a_commence"] = True
-        snap["fige"] = True
-        snap["fige_le"] = snap.get("fige_le") or maintenant_iso
-        snap["date_paris"] = m.get("date_paris") or snap.get("date_paris") or date_ref
-        snapshots.append(snap)
-
+    # Figer les prédictions des matchs qui ont quitté Winamax (démarrés / retirés)
     for cle, old in archives.items():
         if cle in cles_winamax:
             continue
         if not old or not old.get("favori") or old.get("fige"):
             continue
-        # Était sur Winamax, plus listé → considéré démarré / retiré
         snap = dict(old)
         snap["a_commence"] = True
         snap["fige"] = True
@@ -1339,9 +1319,12 @@ def construire_donnees_hot_pronostics_tennis(cache_bust: int = 0):
         snap["statut"] = snap.get("statut") or "Retiré Winamax"
         snapshots.append(snap)
 
-    # 2) Afficher + rafraîchir uniquement les matchs Winamax à venir
+    # Afficher + rafraîchir uniquement les matchs Winamax à venir
     for m in matchs_a_venir:
-        pred = _calculer_prediction_match(m, classements, index_cotes)
+        try:
+            pred = _calculer_prediction_match(m, classements, index_cotes)
+        except Exception:
+            continue
         favori = pred["favori"]
         favori_pct = pred["favori_pct"]
         sets_kind = pred["sets_kind"]
@@ -1358,7 +1341,10 @@ def construire_donnees_hot_pronostics_tennis(cache_bust: int = 0):
         if pred.get("out_rang"):
             parts.append(f"adv. #{pred['out_rang']}")
         if cote_favori:
-            parts.append(f"cote {bookmaker} {float(cote_favori):.2f}")
+            try:
+                parts.append(f"cote {bookmaker} {float(cote_favori):.2f}")
+            except (TypeError, ValueError):
+                parts.append("pas de cote marché")
         else:
             parts.append("pas de cote marché")
         detail_base = " · ".join(parts)
@@ -1366,7 +1352,12 @@ def construire_donnees_hot_pronostics_tennis(cache_bust: int = 0):
             f"Best-of-{m.get('best_of') or 3} · "
             f"{'match équilibré attendu' if sets_kind == 'OUI' else 'écart important → straight sets probable'}"
         )
-        sets_label = f"{sets_kind} ({float(sets_pct):.0f}%)" if sets_pct is not None else str(sets_kind)
+        try:
+            sets_label = (
+                f"{sets_kind} ({float(sets_pct):.0f}%)" if sets_pct is not None else str(sets_kind)
+            )
+        except (TypeError, ValueError):
+            sets_label = str(sets_kind or "—")
         statut = m.get("statut") or "À venir"
         date_paris = m.get("date_paris") or date_ref
         heure = m.get("heure_paris") or "—"
@@ -1577,16 +1568,29 @@ with onglets[1]:
                 "(`[odds_api]` → `api_key`) pour charger les matchs Winamax."
             )
 
-        with st.spinner("Chargement des matchs Winamax + classements ATP/WTA..."):
-            matchs_a_venir, lignes_recap, date_ref = construire_donnees_hot_pronostics_tennis(
-                st.session_state.tennis_hot_bust
+        matchs_a_venir, lignes_recap = [], []
+        date_ref = datetime.now(TZ_PARIS).strftime("%Y-%m-%d")
+        try:
+            with st.spinner("Chargement des matchs Winamax + classements ATP/WTA..."):
+                matchs_a_venir, lignes_recap, date_ref = construire_donnees_hot_pronostics_tennis(
+                    st.session_state.tennis_hot_bust
+                )
+        except Exception as exc:
+            st.error(
+                "Impossible de charger Hot Pronostics pour le moment. "
+                "Réessaie dans quelques secondes."
             )
+            st.caption(f"Détail technique : {type(exc).__name__}: {exc}")
+            matchs_a_venir, lignes_recap = [], []
 
         if not matchs_a_venir:
             st.info("Aucun match tennis à venir chez Winamax pour le moment.")
         else:
             st.subheader("📋 Tableau de bord — Winamax à venir")
-            afficher_tableau_recap_hot_pronostics_tennis(lignes_recap)
+            try:
+                afficher_tableau_recap_hot_pronostics_tennis(lignes_recap)
+            except Exception as exc:
+                st.error(f"Erreur d'affichage du tableau : {type(exc).__name__}: {exc}")
             st.caption(
                 "Victoire : classement ATP/WTA. "
                 "Value : écart algo vs cote Winamax (≥ +5 pts = value forte). "
@@ -1605,7 +1609,10 @@ with onglets[1]:
             )
 
             st.markdown("---")
-            afficher_assistant_hot_pronostics_tennis(lignes_recap, key_prefix="tennis_hot")
+            try:
+                afficher_assistant_hot_pronostics_tennis(lignes_recap, key_prefix="tennis_hot")
+            except Exception as exc:
+                st.caption(f"Assistant indisponible ({type(exc).__name__}).")
 
             with st.expander("Méthodologie", expanded=False):
                 st.markdown(
